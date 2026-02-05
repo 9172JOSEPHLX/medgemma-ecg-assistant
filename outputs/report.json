@@ -1,0 +1,41 @@
+{
+  "meta": {
+    "report_version": "1.0",
+    "model_id": "medgemma_placeholder",
+    "model_version": "0.0",
+    "device": "Galaxy A54",
+    "mode_avion": true,
+    "timestamp_utc": "2026-01-27T19:08:04.425661+00:00"
+  },
+  "qc": {
+    "qc_level": "FAIL",
+    "qc_score": 85,
+    "reasons": [
+      "EXPOSURE_FAIL"
+    ],
+    "metrics": {
+      "blur_lap_var": 2793.821196800093,
+      "p_white": 0.41824060044399025,
+      "p_black": 0.0,
+      "contrast_p95_p5": 78.0,
+      "max_glare_blob_ratio": 0.00024225659818880157,
+      "skew_deg": 0.0,
+      "doc_fill": 0.9970137717819,
+      "ink_ratio": 0.2397481412311921,
+      "quad_confidence": 1.0
+    },
+    "retake_prompt": "Utilise une lumière uniforme (pas de contre-jour), ajuste l’exposition, évite les zones cramées."
+  },
+  "summary": "QC insuffisant : retake recommandé. Basculer sur lecture manuelle / protocole clinique.",
+  "confidence": "LOW",
+  "red_flags": [],
+  "findings": [],
+  "clinician_checklist": [
+    "Reprendre une capture (sans reflets, nette, cadrage complet).",
+    "Si urgence et retake impossible : interprétation clinique standard sans assistance IA."
+  ],
+  "disclaimer": "Aide à l’interprétation/triage uniquement. Ne constitue pas un diagnostic médical. Validation par clinicien requise.",
+  "debug": {
+    "note": "Inference blocked due to QC_FAIL"
+  }
+}

@@ -1,0 +1,1 @@
+<PASTE_HERE_docs_qc_contract_qc_v1_md_CONTENT>

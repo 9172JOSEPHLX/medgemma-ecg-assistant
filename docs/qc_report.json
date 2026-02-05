@@ -1,0 +1,37 @@
+{
+  "schema": "qc.v1",
+  "generated_at": "2026-02-03T19:42:10Z",
+  "input": {
+    "type": "csv",
+    "source_path": "relative/or/redacted",
+    "sample_id": "patient_ecg_20240202",
+    "fs_hz": 500
+  },
+  "pipeline": {
+    "repo": "Appli_MedGem_PoC",
+    "commit": null,
+    "qc_module": "medgem_poc.qc",
+    "qc_version": "1.0.0"
+  },
+  "status": "WARN",
+  "reasons": ["WARN_LOW_SNR", "WARN_QRS_WIDE", "WARN_LIMB_SWAP_LA_LL"],
+  "warnings": [
+    {
+      "code": "WARN_LOW_SNR",
+      "reason": "SNR marginal (7.8). Review recommended."
+    }
+  ],
+  "metrics": {
+    "hr_bpm": 72.3,
+    "rr_ms": 830.0,
+    "pr_ms_est": null,
+    "qrs_ms_est": 92.0,
+    "qt_ms_est": 402.0,
+    "qtc_ms_est": 442.0,
+    "snr_med": 7.8,
+    "baseline_drift_mv": 0.28,
+    "filter_strength": 0.35,
+    "limb_consistency_err": 0.08,
+    "limb_swap_hypothesis": "LA_LL"
+  }
+}

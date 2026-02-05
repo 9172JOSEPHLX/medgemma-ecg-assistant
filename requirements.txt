@@ -1,0 +1,10 @@
+annotated-types==0.7.0
+colorama==0.4.6
+numpy==2.2.6
+opencv-python==4.13.0.90
+pillow==12.1.0
+pydantic==2.12.5
+pydantic_core==2.41.5
+tqdm==4.67.1
+typing-inspection==0.4.2
+typing_extensions==4.15.0
