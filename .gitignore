@@ -1,5 +1,21 @@
+# venv
 .venv/
 .venv-ecg-torch310/
+
+# python cache
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+
+# outputs / artifacts
 outputs/
+*.log
+*.tmp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# notebooks checkpoints
+.ipynb_checkpoints/
