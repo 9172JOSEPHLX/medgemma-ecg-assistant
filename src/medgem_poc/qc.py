@@ -1,4 +1,4 @@
-# qc.py  Version du 05.02.2026 ENRICHI DES BLOCS “QC Normes/Clinique/Mesures”
+# qc.py  Version du 06.02.2026 ENRICHI DES BLOCS “QC Normes/Clinique/Mesures”
 
 from __future__ import annotations
 
@@ -1058,9 +1058,232 @@ def _moving_average(x: np.ndarray, win: int) -> np.ndarray:
 # IEC NORMALISATION (CSV pipeline) — 0.05–150 Hz + notch optionnel (50/60)
 # =============================================================================
 
-def iec_bandpass_filter(x: np.ndarray, fs: float, *, notch_hz: Optional[float] = None, order: int = 4):
-    y, warnings = iec_bandpass_filter_1d(x, fs, notch_hz=notch_hz, order=order)
-    return y, warnings
+def iec_bandpass_filter(
+    x: np.ndarray,
+    fs: float,
+    *,
+    notch_hz: Optional[float] = None,
+    order: int = 4,
+    mode: str = "diagnostic",
+    return_metrics: bool = True,
+) -> tuple[np.ndarray, list[dict[str, Any]], dict[str, Any]]:
+    """
+    IEC-ish normalization wrapper (no SciPy).
+    Delegates actual DSP to `iec_bandpass_filter_1d`.
+
+    Returns:
+      y: filtered signal (float32)
+      warnings: list of {code, reason, severity?}
+      metrics: dict (always returned; can be empty)
+
+    Notes / future:
+      - mode="diagnostic": target 0.05–150 Hz (+ optional notch)
+      - mode="monitoring": target 0.67–40 Hz (+ optional notch)
+      - future per-lead filtering: accept Mapping[str, np.ndarray] + apply per lead
+      - future auto-notch: notch_hz="auto" -> infer 50/60 by region/config
+    """
+    warnings: list[dict[str, Any]] = []
+    metrics: dict[str, Any] = {
+        "iec_filter": True,
+        "method": "iec_bandpass_filter_1d",
+        "mode": str(mode),
+        "fs_hz": float(fs) if _is_finite(fs) else None,
+        "order": int(order),
+        "notch_hz": float(notch_hz) if _is_finite(notch_hz) else None,
+    }
+
+    # Basic input validation (QC-grade, not clinical)
+    try:
+        x_in = np.asarray(x, dtype=np.float32)
+    except Exception:
+        _flag(warnings, "FAIL_IEC_FILTER_BAD_INPUT", "Input cannot be converted to float32.", "FAIL")
+        metrics["ok"] = False
+        metrics["reason"] = "bad_input"
+        # return passthrough (safe)
+        y = np.asarray(x, dtype=np.float32) if x is not None else np.zeros((0,), dtype=np.float32)
+        return y, warnings, metrics
+
+    if x_in.ndim != 1:
+        _flag(warnings, "WARN_IEC_FILTER_NDIM", f"Expected 1D signal, got shape={tuple(x_in.shape)}.", "WARN")
+        x_in = x_in.reshape(-1).astype(np.float32)
+
+    if not _is_finite(fs) or float(fs) <= 0:
+        _flag(warnings, "WARN_IEC_FILTER_FS_INVALID", f"Invalid fs={fs}; using fallback fs=500.", "WARN")
+        fs = 500.0
+        metrics["fs_hz"] = float(fs)
+
+    if x_in.size < int(max(1, round(float(fs) * 0.5))):
+        _flag(warnings, "WARN_IEC_FILTER_TOO_SHORT", "Signal too short for stable filtering; passthrough.", "WARN")
+        metrics["ok"] = False
+        metrics["reason"] = "too_short"
+        return x_in.astype(np.float32), warnings, metrics
+
+    # Call the actual filter (your existing implementation)
+    try:
+        y, w = iec_bandpass_filter_1d(x_in, float(fs), notch_hz=notch_hz, order=order)
+    except TypeError:
+        # backward compat if iec_bandpass_filter_1d signature lacks notch/order
+        y, w = iec_bandpass_filter_1d(x_in, float(fs))
+    except Exception as e:
+        _flag(warnings, "FAIL_IEC_FILTER_EXCEPTION", f"IEC filter failed: {type(e).__name__}", "FAIL")
+        metrics["ok"] = False
+        metrics["reason"] = "exception"
+        return x_in.astype(np.float32), warnings, metrics
+
+    y = np.asarray(y, dtype=np.float32)
+
+    # Merge / normalize warnings
+    if isinstance(w, list):
+        for ww in w:
+            if isinstance(ww, dict) and "code" in ww and "reason" in ww:
+                warnings.append(ww)
+            else:
+                # tolerate old warning shapes
+                _flag(warnings, "WARN_IEC_FILTER_NOTE", str(ww), "WARN")
+    elif w is not None:
+        _flag(warnings, "WARN_IEC_FILTER_NOTE", str(w), "WARN")
+
+    # Safety checks on output
+    if y.shape != x_in.shape:
+        _flag(
+            warnings,
+            "WARN_IEC_FILTER_LEN_CHANGED",
+            f"Filter changed length {y.shape} vs {x_in.shape} (will align).",
+            "WARN",
+        )
+        # align length deterministically
+        n = int(x_in.size)
+        if y.size > n:
+            y = y[:n]
+        else:
+            y = np.pad(y, (0, n - y.size), mode="edge")
+
+    if not np.isfinite(y).all():
+        _flag(warnings, "FAIL_IEC_FILTER_NONFINITE", "Filter output contains NaN/Inf; passthrough.", "FAIL")
+        metrics["ok"] = False
+        metrics["reason"] = "nonfinite"
+        return x_in.astype(np.float32), warnings, metrics
+
+    # “Explosion” detection (QC-grade heuristic)
+    in_std = float(np.std(x_in)) + 1e-9
+    out_std = float(np.std(y)) + 1e-9
+    gain = out_std / in_std
+    metrics["std_in"] = float(in_std)
+    metrics["std_out"] = float(out_std)
+    metrics["std_gain"] = float(gain)
+
+    if gain > 8.0:
+        _flag(
+            warnings,
+            "FAIL_IEC_FILTER_UNSTABLE",
+            f"Filter seems unstable (std_gain={gain:.2f}); passthrough.",
+            "FAIL",
+        )
+        metrics["ok"] = False
+        metrics["reason"] = "unstable"
+        return x_in.astype(np.float32), warnings, metrics
+
+    metrics["ok"] = True
+
+    # Always return 3-tuple (so tools/cts_test.py can consume it cleanly)
+    return y, warnings, metrics
+
+# Inserption here Feb 6th, 2026. 3H45PM
+# =============================================================================
+# IEC-NORMALISATION (CSV pipeline) — 0.05–150 Hz + notch optionnel (50/60)
+# SciPy optionnel: fallback 100% numpy (FFT + cosine taper).
+# =============================================================================
+
+from typing import Iterable  # si pas déjà importé
+
+
+def _fft_bandpass_notch(
+    x: np.ndarray,
+    fs: float,
+    *,
+    low_hz: float = 0.05,
+    high_hz: float = 150.0,
+    notch_hz: Optional[float] = None,
+    notch_bw_hz: float = 1.0,
+    taper_hz: float = 1.0,
+) -> np.ndarray:
+    """
+    NumPy-only frequency-domain bandpass + optional notch.
+    - bandpass: keep [low_hz, high_hz] with cosine tapers (reduces ringing).
+    - notch: attenuate around notch_hz ± notch_bw_hz/2 (also with taper).
+    """
+    x = np.asarray(x, dtype=np.float32)
+    n = int(x.size)
+    if n == 0:
+        return x.copy()
+
+    fs = float(fs)
+    nyq = 0.5 * fs
+
+    # rfft
+    X = np.fft.rfft(x.astype(np.float64), n=n)
+    freqs = np.fft.rfftfreq(n, d=1.0 / fs)
+
+    def _cos_taper_mask(freqs: np.ndarray, f0: float, f1: float, taper: float) -> np.ndarray:
+        """
+        Passband [f0,f1] with cosine ramps of width 'taper' on each side.
+        """
+        m = np.zeros_like(freqs, dtype=np.float64)
+
+        f0 = max(0.0, float(f0))
+        f1 = max(f0, float(f1))
+        taper = max(0.0, float(taper))
+
+        if f1 <= 0.0:
+            return m
+
+        # flat region
+        lo_flat0 = f0 + taper
+        hi_flat1 = f1 - taper
+
+        # rising ramp: [f0, f0+taper]
+        if taper > 0:
+            r0 = f0
+            r1 = f0 + taper
+            sel = (freqs >= r0) & (freqs < r1)
+            # 0..1 raised cosine
+            z = (freqs[sel] - r0) / (r1 - r0 + 1e-12)
+            m[sel] = 0.5 - 0.5 * np.cos(np.pi * z)
+        else:
+            lo_flat0 = f0
+
+        # flat pass
+        sel = (freqs >= lo_flat0) & (freqs <= hi_flat1) if hi_flat1 >= lo_flat0 else np.zeros_like(freqs, dtype=bool)
+        m[sel] = 1.0
+
+        # falling ramp: [f1-taper, f1]
+        if taper > 0:
+            f0b = max(f0, f1 - taper)
+            f1b = f1
+            sel = (freqs > f0b) & (freqs <= f1b)
+            z = (freqs[sel] - f0b) / (f1b - f0b + 1e-12)
+            m[sel] = 0.5 + 0.5 * np.cos(np.pi * z)  # goes 1..0
+        else:
+            # if no taper, hard cut already handled by flat pass
+            pass
+
+        return m
+
+    # bandpass mask
+    bp = _cos_taper_mask(freqs, low_hz, min(high_hz, nyq), taper_hz)
+
+    # notch mask (multiplicative attenuator)
+    notch = np.ones_like(freqs, dtype=np.float64)
+    if notch_hz is not None and notch_hz > 0:
+        f0 = float(notch_hz) - float(notch_bw_hz) / 2.0
+        f1 = float(notch_hz) + float(notch_bw_hz) / 2.0
+        # notch "stop" mask with cosine ramps: 1 outside, 0 inside
+        stop = _cos_taper_mask(freqs, max(0.0, f0), min(nyq, f1), taper=max(0.2, 0.25 * notch_bw_hz))
+        notch = 1.0 - stop
+
+    Y = X * bp * notch
+    y = np.fft.irfft(Y, n=n).astype(np.float32)
+    return y
 
 
 def iec_bandpass_filter_1d(
@@ -1071,100 +1294,206 @@ def iec_bandpass_filter_1d(
     order: int = 4,
 ) -> Tuple[np.ndarray, List[Dict[str, str]]]:
     """
-    IEC-ish preprocessing for digital ECG (QC only):
-      - bandpass 0.05–150 Hz (Butterworth, filtfilt)
-      - optional notch (50/60Hz), Q=30
-    Returns: (x_filt, warnings[])
+    IEC-ish preprocessing for digital ECG (QC-only):
+      - bandpass: 0.05–150 Hz
+      - optional notch: 50/60 Hz (narrow)
+    Returns:
+      (x_filt, warnings)
+    Notes:
+      - If SciPy is available, you MAY later swap to true Butterworth (filtfilt).
+      - This implementation works without SciPy (FFT+taper fallback).
     """
     warnings: List[Dict[str, str]] = []
     x = np.asarray(x, dtype=np.float32)
+
     if x.size == 0:
         return x.copy(), warnings
 
-    if not _is_finite(fs) or float(fs) <= 0:
-        warnings.append({"code": "WARN_FILTER_BAD_FS", "reason": f"Invalid fs={fs}; IEC filter skipped"})
-        return x.copy(), warnings
-
-    try:
-        from scipy import signal as sp_signal  # type: ignore
-    except Exception:
-        warnings.append({"code": "WARN_FILTER_SCIPY_MISSING", "reason": "scipy not available; IEC filter skipped"})
+    if (not _is_finite(fs)) or float(fs) <= 0:
+        warnings.append({"code": "WARN_FILTER_BAD_FS", "reason": f"Invalid fs={fs}; IEC filter skipped."})
         return x.copy(), warnings
 
     fsf = float(fs)
     nyq = 0.5 * fsf
 
-    lo = 0.05 / nyq
-    hi = 150.0 / nyq
+    # validate band
+    low_hz = 0.05
+    high_hz = 150.0
 
-    # clamp if fs too low
-    if hi >= 1.0:
-        hi = min(0.99, hi)
-        warnings.append({"code": "WARN_FILTER_FS_LOW_CLAMP", "reason": f"fs={fsf} too low for 150Hz; high cutoff clamped"})
+    if high_hz >= nyq:
+        warnings.append(
+            {"code": "WARN_FILTER_BAND_CLIPPED", "reason": f"high_hz={high_hz} >= Nyquist={nyq:.1f}; clipped."}
+        )
+        high_hz = max(0.1, nyq - 0.5)
 
-    if lo <= 0 or lo >= 1.0 or hi <= 0 or hi >= 1.0 or lo >= hi:
-        warnings.append({"code": "WARN_FILTER_BAD_BAND", "reason": f"Bad band params lo={lo:.4f}, hi={hi:.4f}; IEC filter skipped"})
+    if low_hz <= 0 or low_hz >= high_hz:
+        warnings.append({"code": "WARN_FILTER_BAD_BAND", "reason": f"Bad band {low_hz}-{high_hz} Hz; skipped."})
         return x.copy(), warnings
 
-    b, a = sp_signal.butter(int(order), [lo, hi], btype="band")
-    xf = sp_signal.filtfilt(b, a, x).astype(np.float32)
+    # validate notch
+    notch_ok = False
+    notch_use = None
+    if notch_hz is not None:
+        try:
+            nhz = float(notch_hz)
+            if nhz <= 0 or nhz >= nyq:
+                warnings.append(
+                    {"code": "WARN_FILTER_NOTCH_INVALID", "reason": f"notch_hz={notch_hz} out of range; ignored."}
+                )
+            else:
+                notch_ok = True
+                notch_use = nhz
+        except Exception:
+            warnings.append({"code": "WARN_FILTER_NOTCH_INVALID", "reason": f"notch_hz={notch_hz} invalid; ignored."})
 
-    if notch_hz is not None and _is_finite(notch_hz) and float(notch_hz) > 0:
-        w0 = float(notch_hz) / nyq
-        if 0 < w0 < 1:
-            bn, an = sp_signal.iirnotch(w0, Q=30.0)
-            xf = sp_signal.filtfilt(bn, an, xf).astype(np.float32)
-        else:
-            warnings.append({"code": "WARN_FILTER_BAD_NOTCH", "reason": f"notch {notch_hz}Hz invalid for fs={fsf}"})
+    # Optional SciPy path (future): keep, but do not require SciPy.
+    # If absent, we use NumPy-only fallback.
+    use_scipy = False
+    try:
+        import scipy.signal as sp_signal  # type: ignore
+        use_scipy = True
+    except Exception:
+        use_scipy = False
 
-    return xf, warnings
+    if use_scipy:
+        # True IIR (Butterworth) + filtfilt; notch via iirnotch (Q~30)
+        # Still QC-only.
+        try:
+            wp = [low_hz / nyq, high_hz / nyq]
+            b, a = sp_signal.butter(int(max(2, order)), wp, btype="bandpass")
+            y = sp_signal.filtfilt(b, a, x.astype(np.float64)).astype(np.float32)
 
+            if notch_ok and notch_use is not None:
+                # narrow notch (Q=30)
+                b2, a2 = sp_signal.iirnotch(w0=notch_use / nyq, Q=30.0)
+                y = sp_signal.filtfilt(b2, a2, y.astype(np.float64)).astype(np.float32)
+
+            return y, warnings
+        except Exception as e:
+            warnings.append({"code": "WARN_FILTER_SCIPY_FAILED", "reason": f"SciPy filter failed; fallback FFT. ({e})"})
+
+    # NumPy-only fallback (FFT+taper)
+    # notch bandwidth: keep narrow so it doesn't kill QRS
+    notch_bw = 1.0  # Hz
+    taper = 1.0     # Hz taper at band edges
+    y = _fft_bandpass_notch(
+        x,
+        fsf,
+        low_hz=low_hz,
+        high_hz=high_hz,
+        notch_hz=notch_use if notch_ok else None,
+        notch_bw_hz=notch_bw,
+        taper_hz=taper,
+    )
+
+    if x.size < int(1.0 * fsf):
+        warnings.append({"code": "WARN_FILTER_SHORT_SIGNAL", "reason": "Signal < 1s; FFT filtering may be unstable at edges."})
+
+    return y, warnings
+
+# Inserption here Feb 6th, 2026. 3H45PM modified 09H08 PM
+
+from typing import Iterable
 
 def _iec_normalize_leads(
     leads: Mapping[str, np.ndarray],
     fs: float,
     *,
-    notch_hz: Optional[float] = None,
-) -> Tuple[Dict[str, np.ndarray], List[Dict[str, str]]]:
+    notch_hz: Optional[float] = 50.0,
+    order: int = 4,
+    mode: str = "diagnostic",
+) -> tuple[dict[str, np.ndarray], list[dict[str, Any]], dict[str, Any]]:
     """
-    Filtre IEC toutes les dérivations (recommandé pour cohérences inter-leads).
-    Retour: (leads_filt, warnings)
+    Apply IEC-ish bandpass (+ optional notch) to each lead using iec_bandpass_filter().
+    Returns:
+      filtered_leads: dict lead->filtered 1D float32
+      warnings: aggregated warnings (list of dict)
+      metrics: aggregated metrics (per-lead + summary)
     """
-    warnings: List[Dict[str, str]] = []
-    out: Dict[str, np.ndarray] = {}
+    # --- notch_hz validation (dataset/demo expectation) ---
+    # Accept only 50 or 60 Hz. If invalid, do NOT crash: emit a WARN and skip notch.
+    notch_invalid = False
+    try:
+        if notch_hz is None:
+            notch_invalid = False  # explicit disable => OK
+        else:
+            nhz = float(notch_hz)
+            if (not np.isfinite(nhz)) or (nhz not in (50.0, 60.0)):
+                notch_invalid = True
+    except Exception:
+        notch_invalid = True
+
+    filtered: dict[str, np.ndarray] = {}
+    warnings: list[dict[str, Any]] = []
+    metrics: dict[str, Any] = {
+        "iec_normalize": True,
+        "mode": str(mode),
+        "fs_hz": float(fs) if _is_finite(fs) else None,
+        "notch_hz": float(notch_hz) if (notch_hz is not None and _is_finite(notch_hz)) else None,
+        "order": int(order),
+        "per_lead": {},
+    }
 
     if not leads:
-        return out, warnings
+        _flag(warnings, "FAIL_IEC_NO_LEADS", "No leads provided to IEC normalize.", "FAIL")
+        metrics["ok"] = False
+        metrics["reason"] = "no_leads"
+        return {}, warnings, metrics
 
-    any_ok = False
-    for k, v in leads.items():
-        if v is None:
+    if notch_invalid:
+        warnings.append(
+            {
+                "code": "WARN_IEC_NOTCH_INVALID",
+                "reason": f"Invalid notch_hz={notch_hz}. Expected 50 or 60 Hz. Notch disabled.",
+                "severity": "WARN",
+            }
+        )
+        notch_hz = None
+
+    for name, arr in leads.items():
+        if arr is None:
             continue
-        x = np.asarray(v, dtype=np.float32)
-        if x.size == 0:
+        x = np.asarray(arr, dtype=np.float32).reshape(-1)
+        if x.size < 2:
             continue
-        xf, w = iec_bandpass_filter_1d(x, fs, notch_hz=notch_hz)
-        out[k] = xf
-        warnings.extend(w)
-        any_ok = True
 
-    if not any_ok:
-        # fallback: return original as arrays
-        for k, v in leads.items():
-            if v is not None:
-                out[k] = np.asarray(v, dtype=np.float32)
-        warnings.append({"code": "WARN_FILTER_NO_USABLE_LEADS", "reason": "No usable leads to filter; using raw leads"})
-    return out, warnings
+        y, w, m = iec_bandpass_filter(
+            x, float(fs), notch_hz=notch_hz, order=order, mode=mode, return_metrics=True
+        )
+        filtered[str(name)] = np.asarray(y, dtype=np.float32)
+
+        # aggregate warnings
+        if isinstance(w, list):
+            for ww in w:
+                if isinstance(ww, dict):
+                    warnings.append(ww)
+                else:
+                    _flag(warnings, "WARN_IEC_FILTER_NOTE", f"{name}: {ww}", "WARN")
+        elif w is not None:
+            _flag(warnings, "WARN_IEC_FILTER_NOTE", f"{name}: {w}", "WARN")
+
+        # store per-lead metrics (optional)
+        if isinstance(m, dict):
+            metrics["per_lead"][str(name)] = m
+
+    metrics["n_leads_in"] = int(len(leads))
+    metrics["n_leads_out"] = int(len(filtered))
+    metrics["ok"] = True if filtered else False
+    if not filtered:
+        metrics["reason"] = "no_filtered_output"
+        _flag(warnings, "FAIL_IEC_NO_OUTPUT", "IEC normalize produced no output leads.", "FAIL")
+
+    return filtered, warnings, metrics
 
 
-def _robust_snr_and_baseline(x_mv: np.ndarray, fs: float) -> tuple[float, float, float]:
+def _robust_snr_and_baseline(x_mv: np.ndarray, fs: float) -> tuple[float, float, float, float]:
     """
-    Returns (snr_med, baseline_drift_mv, filter_strength[0..1-ish]).
+    Returns (snr_med, baseline_drift_mv, filter_strength[0..1-ish], noise_rms_uv).
     Heuristics: no clinical guarantee; QC only.
     """
     x = np.asarray(x_mv, dtype=np.float32)
     if x.size < int(fs * 1.0):
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0
 
     win_base = int(max(3, round(fs * 0.8)))
     base = _moving_average(x, win_base)
@@ -1172,7 +1501,7 @@ def _robust_snr_and_baseline(x_mv: np.ndarray, fs: float) -> tuple[float, float,
 
     b5 = float(np.percentile(base, 5))
     b95 = float(np.percentile(base, 95))
-    baseline_drift = float(b95 - b5)
+    baseline_drift = float(b95 - b5)  # mV (robust ~p2p)
 
     win_smooth = int(max(3, round(fs * 0.04)))
     smooth = _moving_average(detr, win_smooth)
@@ -1190,7 +1519,9 @@ def _robust_snr_and_baseline(x_mv: np.ndarray, fs: float) -> tuple[float, float,
     ratio = hf_std / (sm_std + 1e-6)
     filter_strength = float(np.clip((0.08 - ratio) / 0.08, 0.0, 1.0))
 
-    return snr, baseline_drift, filter_strength
+    noise_rms_uv = float(noise_sigma * 1000.0)  # mV -> µV
+
+    return snr, baseline_drift, filter_strength, noise_rms_uv
 
 
 def _detect_r_peaks(x_mv: np.ndarray, fs: float) -> np.ndarray:
@@ -1467,10 +1798,14 @@ def save_qc_report_json(path: str, report: dict[str, Any]) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
 
+# ===========================================================================================
+# Fi2 — qc_signal_from_leads (arrays) : stable + utile pour run_qc_on_csv.py Version 090226
+# Updated 090226 — IEC gate (Fs/noise/drift), constant-lead check, filter warn dedup
+# # UPDATED le 11/02/2026 12H26
+# ===========================================================================================
 
-# =============================================================================
-# Fi2 — qc_signal_from_leads (arrays) : stable + utile pour run_qc_on_csv.py
-# =============================================================================
+from typing import Mapping, Dict, Any, List, Optional
+import numpy as np
 
 def qc_signal_from_leads(
     leads: Mapping[str, np.ndarray],
@@ -1483,37 +1818,155 @@ def qc_signal_from_leads(
     """
     Fi2: QC "signal" depuis arrays de leads.
     Retour dict contract-ready shape:
-      {status, reasons, warnings[{code,reason}], metrics{...}}
+      {status, reasons, warnings[{code,reason, (severity)}], metrics{...}}
 
     IEC Normalisation:
       - appliquée AVANT toute mesure si iec_normalize=True
-      - warnings du filtre remontent dans warnings/reasons
+      - warnings du filtre remontent dans warnings + reasons
+      - IEC est appliqué au niveau des leads (pas uniquement sur x) pour éviter toute incohérence.
     """
     warnings: List[Dict[str, str]] = []
     reasons: List[str] = []
     status = "PASS"
 
     if not leads:
-        _flag(warnings, reasons, "FAIL_NO_SIGNAL", "No leads found in CSV.")
-        return {"status": "FAIL", "reasons": reasons, "warnings": warnings, "metrics": {}}
+        _flag(warnings, reasons, "FAIL_NO_SIGNAL", "No leads found in CSV.", "FAIL")
+        return {"status": "FAIL", "reasons": list(dict.fromkeys(reasons)), "warnings": warnings, "metrics": {}}
 
-    sex = _normalize_sex(patient_sex if patient_sex in ("M", "F") else ("F" if str(patient_sex).upper().startswith("F") else "M"))
+    # ---------------- normalize sex + fs early ----------------
+    sex_in = str(patient_sex).upper().strip() if patient_sex is not None else "U"
+    sex = _normalize_sex(sex_in if sex_in in ("M", "F", "U") else "U")
 
     fs = float(fs_hz) if _is_finite(fs_hz) and float(fs_hz) > 0 else 500.0
+
+    # We'll build metrics progressively
+    metrics: Dict[str, Any] = {
+        "fs_hz": float(fs),
+        "iec_band": "0.05-150Hz",
+    }
+
+    # ---------------- IEC gate: Fs ----------------
+    # IEC/AHA: Fs >= 250 Hz minimum; 500 Hz recommended for diagnostic.
+    if fs < 250.0:
+        _flag(warnings, reasons, "FAIL_FS_TOO_LOW", f"Sampling rate too low ({fs:.1f} Hz).", "FAIL")
+        return {"status": "FAIL", "reasons": list(dict.fromkeys(reasons)), "warnings": warnings, "metrics": metrics}
+    elif fs < 500.0:
+        _flag(warnings, reasons, "WARN_FS_BELOW_RECOMMENDED", f"Sampling rate below recommended 500 Hz ({fs:.1f} Hz).", "WARN")
+        status = _worse_status(status, "WARN")
+
+    # --- Baseline drift estimator (shared; used for per-lead raw/post-IEC drift maps) ---
+    def _drift_mv_one_lead(x: np.ndarray, fs_local: float) -> Optional[float]:
+        """
+        Robust baseline drift estimator (mV) for a single lead.
+        Uses a slow baseline proxy (moving average) then p95-p5 peak-to-peak.
+        """
+        try:
+            x = np.asarray(x, dtype=np.float32)
+            if x.ndim != 1:
+                return None
+            if x.size < int(1.0 * fs_local):  # need >=1s
+                return None
+            if not np.isfinite(x).any():
+                return None
+
+            win = int(max(1, round(0.8 * fs_local)))  # ~0.8s window
+            if win >= x.size:
+                return None
+
+            k = np.ones((win,), dtype=np.float32) / float(win)
+            baseline = np.convolve(x, k, mode="same")
+
+            p5 = float(np.nanpercentile(baseline, 5))
+            p95 = float(np.nanpercentile(baseline, 95))
+            d = p95 - p5
+            if not np.isfinite(d):
+                return None
+            return float(d)
+        except Exception:
+            return None
+
+    # --- RAW baseline drift per-lead (pre-IEC) + conservative aggregation (MAX) ---
+    # Rationale: dataset may inject drift on a single lead; using lead_used (e.g., II) can miss it.
+    raw_baseline_drift_mv_by_lead: Dict[str, float] = {}
+    for lname, sig in (leads or {}).items():
+        d = _drift_mv_one_lead(sig, float(fs))
+        if d is not None and np.isfinite(d):
+            raw_baseline_drift_mv_by_lead[str(lname)] = float(d)
+    raw_baseline_drift_mv = max(raw_baseline_drift_mv_by_lead.values()) if raw_baseline_drift_mv_by_lead else None
+
+    # --- notch_hz validation (must be independent of iec_normalize) ---
+    # Dataset expects WARN when notch_hz is invalid (not 50/60). Do NOT crash; disable notch.
+    notch_invalid = False
+    try:
+        if notch_hz is None:
+            notch_invalid = False  # explicit disable => OK
+        else:
+            nhz = float(notch_hz)
+            if (not np.isfinite(nhz)) or (nhz not in (50.0, 60.0)):
+                notch_invalid = True
+    except Exception:
+        notch_invalid = True
+
+    if notch_invalid:
+        _flag(
+            warnings,
+            reasons,
+            "WARN_IEC_NOTCH_INVALID",
+            f"Invalid notch_hz={notch_hz}. Expected 50 or 60 Hz. Notch disabled.",
+            "WARN",
+        )
+        status = _worse_status(status, "WARN")
+        notch_hz = None  # sanitize for downstream (IEC or not)
+
 
     # -------- IEC normalisation (bandpass + optional notch) BEFORE MEASURES --------
     leads_proc: Mapping[str, np.ndarray] = leads
     iec_applied = False
+    iec_filter_metrics: Dict[str, Any] = {}
+
     if iec_normalize:
-        filtered, w = _iec_normalize_leads(leads, fs, notch_hz=notch_hz)
-        if filtered:
+        filtered, w, f_metrics = _iec_normalize_leads(leads, fs, notch_hz=notch_hz)
+
+        # adopt filtered leads if any
+        if isinstance(filtered, dict) and len(filtered) > 0:
             leads_proc = filtered
             iec_applied = True
-        # push warnings into contract output (and reasons via qc_pack_v1)
-        for ww in w:
-            _flag(warnings, reasons, ww.get("code", "WARN_FILTER_UNKNOWN"), ww.get("reason", "IEC filter warning."))
-    # ---------------------------------------------------------------------------
 
+        # propagate warnings into contract output (DEDUP by code)
+        seen_codes = set()
+        if isinstance(w, list):
+            for ww in w:
+                if isinstance(ww, dict):
+                    code = ww.get("code", "WARN_IEC_FILTER")
+                    if code in seen_codes:
+                        continue
+                    seen_codes.add(code)
+                    _flag(
+                        warnings,
+                        reasons,
+                        code,
+                        ww.get("reason", "IEC filter warning."),
+                        ww.get("severity", "WARN"),
+                    )
+                else:
+                    code = "WARN_IEC_FILTER_NOTE"
+                    if code not in seen_codes:
+                        seen_codes.add(code)
+                        _flag(warnings, reasons, code, str(ww), "WARN")
+        elif w is not None:
+            _flag(warnings, reasons, "WARN_IEC_FILTER_NOTE", str(w), "WARN")
+
+        iec_filter_metrics = f_metrics if isinstance(f_metrics, dict) else {}
+
+    # --- POST-IEC baseline drift per-lead (optional, for reporting) ---
+    baseline_drift_mv_by_lead: Dict[str, float] = {}
+    for lname, sig in (leads_proc or {}).items():
+        d = _drift_mv_one_lead(sig, float(fs))
+        if d is not None and np.isfinite(d):
+            baseline_drift_mv_by_lead[str(lname)] = float(d)
+    baseline_drift_mv = max(baseline_drift_mv_by_lead.values()) if baseline_drift_mv_by_lead else None
+
+    # ---------------------------------------------------------------------------
     # Pick a representative lead for timing/SNR metrics (from leads_proc)
     x = None
     pick = None
@@ -1522,23 +1975,155 @@ def qc_signal_from_leads(
             x = np.asarray(leads_proc[k], dtype=np.float32)
             pick = k
             break
+
     if x is None:
         for k, v in leads_proc.items():
             if v is not None and len(v) > 10:
                 x = np.asarray(v, dtype=np.float32)
                 pick = k
                 break
-    if x is None:
-        _flag(warnings, reasons, "FAIL_NO_SIGNAL", "No usable lead arrays found.")
-        return {"status": "FAIL", "reasons": reasons, "warnings": warnings, "metrics": {}}
 
-    snr_med, baseline_drift_mv, filter_strength = _robust_snr_and_baseline(x, fs)
+    if x is None:
+        _flag(warnings, reasons, "FAIL_NO_SIGNAL", "No usable lead arrays found.", "FAIL")
+        return {"status": "FAIL", "reasons": list(dict.fromkeys(reasons)), "warnings": warnings, "metrics": metrics}
+
+    # Prefer RAW lead for dropout/baseline detection (pre-IEC), when available
+    x_raw = None
+    try:
+        if pick is not None and pick in leads and leads[pick] is not None and len(leads[pick]) > 10:
+            x_raw = np.asarray(leads[pick], dtype=np.float32)
+    except Exception:
+        x_raw = None
+
+    # ---------------- Constant/zero lead detection across leads (RAW) ----------------
+    def _lead_is_constant(y: np.ndarray, eps_std: float = 1e-6, eps0: float = 1e-4) -> bool:
+        y = np.asarray(y, dtype=np.float32)
+        # ignore extremely short arrays (<200 ms) to avoid false FAIL
+        if y.size < int(fs * 0.2):
+            return False
+        if not np.isfinite(y).all():
+            return True
+        if float(np.std(y)) < eps_std:
+            return True
+        frac_zero = float((np.abs(y) < eps0).mean())
+        return frac_zero > 0.98
+
+    bad: List[str] = []
+    lead_stats: Dict[str, Any] = {}
+
+    if isinstance(leads, dict):
+        for k, v in leads.items():
+            if v is None:
+                continue
+            yy = np.asarray(v, dtype=np.float32)
+            if yy.size < 10:
+                continue
+            frac_zero = float((np.abs(yy) < 1e-4).mean())
+            stdv = float(np.std(yy)) if yy.size > 1 else 0.0
+            lead_stats[str(k)] = {"n": int(yy.size), "std": stdv, "frac_zero": frac_zero}
+            if _lead_is_constant(yy):
+                bad.append(str(k))
+
+    metrics["lead_stats"] = lead_stats
+    metrics["constant_leads"] = bad
+
+    if len(bad) >= 1:
+        _flag(warnings, reasons, "FAIL_SIGNAL_CONSTANT_LEAD", f"Constant/zero leads detected: {bad}", "FAIL")
+        status = "FAIL"
+
+    # ---------------- Dropout / flat segment detection (QC-grade, robust) ----------------
+    x_for_drop = x_raw if x_raw is not None else x
+    x0 = np.asarray(x_for_drop, dtype=np.float32)
+
+    if x0.size >= 3:
+        eps_dx = 1e-5  # mV per sample threshold for "no change"
+        dx = np.abs(np.diff(x0))
+        is_flat = dx < eps_dx
+
+        max_run = 0
+        run = 0
+        for b in is_flat:
+            if bool(b):
+                run += 1
+                if run > max_run:
+                    max_run = run
+            else:
+                run = 0
+
+        max_run_ms = (float(max_run + 1) * 1000.0) / fs
+        frac_flat = float(is_flat.mean())
+
+        eps0 = 1e-4  # mV
+        frac_zero = float((np.abs(x0) < eps0).mean())
+
+        metrics["dropout"] = {
+            "lead_for_drop": str(pick),
+            "used_raw": bool(x_raw is not None),
+            "eps_dx": float(eps_dx),
+            "max_flat_run_ms": float(max_run_ms),
+            "frac_flat_diffs": float(frac_flat),
+            "eps0": float(eps0),
+            "frac_zero": float(frac_zero),
+        }
+
+        if max_run_ms >= 300.0:
+            _flag(warnings, reasons, "FAIL_SIGNAL_DROPOUT", f"Detected flat/dropout segment ~{max_run_ms:.0f} ms.", "FAIL")
+            status = "FAIL"
+        elif frac_flat >= 0.20 or frac_zero >= 0.20:
+            _flag(
+                warnings,
+                reasons,
+                "WARN_SIGNAL_DROPOUT",
+                f"Suspicious flatness (flat_diffs={frac_flat:.2%}, near_zero={frac_zero:.2%}).",
+                "WARN",
+            )
+            status = _worse_status(status, "WARN")
+
+    # ---------------- SNR / baseline drift / noise RMS (QC-only) ----------------
+    # Accept both function signatures:
+    #   old: (snr, drift, filter_strength)
+    #   new: (snr, drift, filter_strength, noise_rms_uv)
+    noise_rms_uv = None
+    baseline_drift_mv_pick = None
+    filter_strength = 0.0
+
+    try:
+        out = _robust_snr_and_baseline(x, fs)
+        if isinstance(out, tuple) and len(out) == 4:
+            snr_med, baseline_drift_mv_pick, filter_strength, noise_rms_uv = out
+        else:
+            snr_med, baseline_drift_mv_pick, filter_strength = out
+    except Exception:
+        snr_med, baseline_drift_mv_pick, filter_strength = 0.0, None, 0.0
+        noise_rms_uv = None
+
+    # Noise RMS gates (IEC-ish)
+    if noise_rms_uv is not None and _is_finite(noise_rms_uv):
+        metrics["noise_rms_uv"] = float(noise_rms_uv)
+        if float(noise_rms_uv) > 50.0:
+            _flag(warnings, reasons, "FAIL_NOISE_RMS_HIGH", f"Noise RMS too high ({float(noise_rms_uv):.1f} µV).", "FAIL")
+            status = "FAIL"
+        elif float(noise_rms_uv) > 30.0:
+            _flag(warnings, reasons, "WARN_NOISE_RMS_HIGH", f"Noise RMS elevated ({float(noise_rms_uv):.1f} µV).", "WARN")
+            status = _worse_status(status, "WARN")
+    else:
+        metrics["noise_rms_uv"] = None
+
+    # Optional: RAW baseline drift on the picked lead (debug only; does NOT override raw max-by-lead)
+    raw_baseline_drift_mv_pick = None
+    if x_raw is not None:
+        try:
+            out_raw = _robust_snr_and_baseline(x_raw, fs)
+            if isinstance(out_raw, tuple) and len(out_raw) >= 2:
+                raw_baseline_drift_mv_pick = float(out_raw[1])
+        except Exception:
+            raw_baseline_drift_mv_pick = None
 
     # RR/HR from R peaks
     peaks = _detect_r_peaks(x, fs)
     rr_ms = None
     hr_bpm = None
-    if peaks.size >= 2:
+    if getattr(peaks, "size", 0) >= 2:
         rr_ms = float(np.median(np.diff(peaks)) * 1000.0 / fs)
         if rr_ms > 0:
             hr_bpm = float(60000.0 / rr_ms)
@@ -1555,32 +2140,48 @@ def qc_signal_from_leads(
     limb_consistency_err = _limb_consistency_error(leads_proc, fs)
     best_hyp, best_err, normal_err = _infer_limb_swap(leads_proc, fs)
 
-    # heuristics → warnings/reasons/status
-    if snr_med < 5.0:
-        _flag(warnings, reasons, "FAIL_LOW_SNR", f"SNR too low ({snr_med:.1f}).")
+    # --- SNR gates (PoC) ---
+    try:
+        snr_val = float(snr_med)
+    except Exception:
+        snr_val = 0.0
+
+    if snr_val < 2.0:
+        _flag(warnings, reasons, "FAIL_LOW_SNR", f"SNR too low ({snr_val:.1f}).", "FAIL")
         status = "FAIL"
-    elif snr_med < 10.0:
-        _flag(warnings, reasons, "WARN_LOW_SNR", f"SNR marginal ({snr_med:.1f}). Review recommended.")
+    elif snr_val < 5.0:
+        _flag(warnings, reasons, "WARN_LOW_SNR", f"SNR marginal ({snr_val:.1f}).", "WARN")
         status = _worse_status(status, "WARN")
 
-    if baseline_drift_mv > 0.5:
-        _flag(warnings, reasons, "WARN_BASELINE_DRIFT", f"Baseline drift high ({baseline_drift_mv:.2f} mV).")
-        status = _worse_status(status, "WARN")
+    # --- baseline drift gating (dataset-aligned thresholds) ---
+    BW_WARN_MV = 0.60
+    BW_FAIL_MV = 2.00  # FAIL only for extreme drift
+
+    # IMPORTANT: raw_baseline_drift_mv must be the MAX-by-lead computed earlier (pre-IEC)
+    drift_for_gate = raw_baseline_drift_mv if _is_finite(raw_baseline_drift_mv) else baseline_drift_mv
+    if _is_finite(drift_for_gate):
+        d = float(drift_for_gate)
+        if d >= BW_FAIL_MV:
+            _flag(warnings, reasons, "FAIL_BASELINE_DRIFT", f"Baseline drift too high ({d:.2f} mV).", "FAIL")
+            status = "FAIL"
+        elif d >= BW_WARN_MV:
+            _flag(warnings, reasons, "WARN_BASELINE_DRIFT", f"Baseline drift elevated ({d:.2f} mV).", "WARN")
+            status = _worse_status(status, "WARN")
 
     if _is_finite(qrs_ms_est) and float(qrs_ms_est) >= QRS_WIDE:
-        _flag(warnings, reasons, "WARN_QRS_WIDE", f"QRS wide ({float(qrs_ms_est):.0f} ms).")
+        _flag(warnings, reasons, "WARN_QRS_WIDE", f"QRS wide ({float(qrs_ms_est):.0f} ms).", "WARN")
         status = _worse_status(status, "WARN")
 
-    if _is_finite(qtc_ms_est):
+    if _is_finite(qtc_ms_est) and sex in ("M", "F"):
         qtc = float(qtc_ms_est)
         if qtc >= QTc_HIGH_RISK:
-            _flag(warnings, reasons, "WARN_QTC_HIGH_RISK", f"QTc ≥ {QTc_HIGH_RISK} ms ({qtc:.0f} ms).")
+            _flag(warnings, reasons, "WARN_QTC_HIGH_RISK", f"QTc ≥ {QTc_HIGH_RISK} ms ({qtc:.0f} ms).", "WARN")
             status = _worse_status(status, "WARN")
         elif qtc >= QTc_PROLONGED[sex]:
-            _flag(warnings, reasons, "WARN_QTC_PROLONGED", f"QTc prolonged ({qtc:.0f} ms) for sex={sex}.")
+            _flag(warnings, reasons, "WARN_QTC_PROLONGED", f"QTc prolonged ({qtc:.0f} ms) for sex={sex}.", "WARN")
             status = _worse_status(status, "WARN")
         elif qtc <= QTc_SHORT:
-            _flag(warnings, reasons, "WARN_QTC_SHORT", f"QTc short ({qtc:.0f} ms).")
+            _flag(warnings, reasons, "WARN_QTC_SHORT", f"QTc short ({qtc:.0f} ms).", "WARN")
             status = _worse_status(status, "WARN")
 
     # limb swap hypothesis: only warn if it improves materially
@@ -1594,34 +2195,77 @@ def qc_signal_from_leads(
                     reasons,
                     f"WARN_LIMB_SWAP_{best_hyp}",
                     f"Possible limb lead swap hypothesis={best_hyp} (err {best_err:.3f} vs normal {normal_err:.3f}).",
+                    "WARN",
                 )
                 status = _worse_status(status, "WARN")
 
     # ensure FAIL if any FAIL_*
-    if any(str(w.get("code", "")).startswith("FAIL_") for w in warnings):
+    if any(str(w.get("code", "")).startswith("FAIL_") for w in warnings if isinstance(w, dict)):
         status = "FAIL"
 
-    metrics = {
-        "hr_bpm": hr_bpm,
-        "rr_ms": rr_ms,
-        "pr_ms_est": pr_ms_est,
-        "qrs_ms_est": qrs_ms_est,
-        "qt_ms_est": qt_ms_est,
-        "qtc_ms_est": qtc_ms_est,
-        "snr_med": float(snr_med),
-        "baseline_drift_mv": float(baseline_drift_mv),
-        "filter_strength": float(filter_strength),
-        "limb_consistency_err": float(limb_consistency_err) if limb_consistency_err is not None else None,
-        "limb_swap_hypothesis": limb_swap_hypothesis,
-        "fs_hz": float(fs),
-        "lead_used": pick,
-        "iec_normalized": bool(iec_applied),
-        "iec_notch_hz": float(notch_hz) if (notch_hz is not None and _is_finite(notch_hz)) else None,
-        "iec_band": "0.05-150Hz",
-    }
+    # If any WARN present and status still PASS -> bump to WARN
+    if status == "PASS":
+        for w in warnings:
+            code = str(w.get("code", ""))
+            sev = str(w.get("severity", ""))
+            if sev == "WARN" or code.startswith("WARN_"):
+                status = "WARN"
+                break
+
+    # finalize metrics (keep drift max-by-lead + debug pick values)
+    metrics.update(
+        {
+            "hr_bpm": hr_bpm,
+            "rr_ms": rr_ms,
+            "pr_ms_est": pr_ms_est,
+            "qrs_ms_est": qrs_ms_est,
+            "qt_ms_est": qt_ms_est,
+            "qtc_ms_est": qtc_ms_est,
+            "snr_med": float(snr_med) if _is_finite(snr_med) else None,
+
+            # Drift scalars: prefer max-by-lead (raw + post-IEC)
+            "baseline_drift_mv": float(baseline_drift_mv) if _is_finite(baseline_drift_mv) else None,
+            "raw_baseline_drift_mv": float(raw_baseline_drift_mv) if _is_finite(raw_baseline_drift_mv) else None,
+
+            # Optional debug: drift maps + picked-lead drift values
+            "baseline_drift_mv_by_lead": baseline_drift_mv_by_lead if "baseline_drift_mv_by_lead" in locals() else None,
+            "raw_baseline_drift_mv_by_lead": raw_baseline_drift_mv_by_lead if "raw_baseline_drift_mv_by_lead" in locals() else None,
+            "baseline_drift_mv_pick": float(baseline_drift_mv_pick) if _is_finite(baseline_drift_mv_pick) else None,
+            "raw_baseline_drift_mv_pick": float(raw_baseline_drift_mv_pick) if _is_finite(raw_baseline_drift_mv_pick) else None,
+
+            "filter_strength": float(filter_strength) if _is_finite(filter_strength) else None,
+            "limb_consistency_err": float(limb_consistency_err) if limb_consistency_err is not None else None,
+            "limb_swap_hypothesis": limb_swap_hypothesis,
+            "lead_used": pick,
+
+            # IEC metadata (déjà définis plus haut)
+            "iec_normalized": bool(iec_applied),
+            "iec_notch_hz": float(notch_hz) if (notch_hz is not None and _is_finite(notch_hz)) else None,
+            "iec_filter": iec_filter_metrics,
+        }
+    )
 
     reasons = list(dict.fromkeys(reasons))
-    return {"status": status, "reasons": reasons, "warnings": warnings, "metrics": metrics}
+
+    dataset_payload = {
+        "status": status,
+        "status_strict": status,
+        "metrics": metrics,
+        "warnings": warnings,
+        "reasons": reasons,
+    }
+    dataset_status = _map_to_dataset_status(dataset_payload)
+
+    return {
+        "status": status,  # canonical status (= strict)
+        "status_strict": status,
+        "status_dataset_aligned": dataset_status,
+        "reasons": reasons,
+        "warnings": warnings,
+        "metrics": metrics,
+    }
+
+# Terminus du Code "qc_signal_from_leads" UPDATED le 11/02/2026 12H26 et ensuite 12H37
 
 
 # =============================================================================
@@ -1693,4 +2337,89 @@ def qc_pack_v1(
         "metrics": metrics,
     }
 
-# TERMINUS
+### --- map to dataset status (covers WARN and FAIL forms) ---- ###  Created Feb 10th, 2026 Updated Feb 11th, 2026
+
+def _map_to_dataset_status(qc_out: Dict[str, Any]) -> str:
+    """
+    Dataset-aligned status mapping (pedagogical demo alignment).
+    Does NOT replace strict IEC status.
+
+    Updated:
+      - Takes qc_out["warnings"] codes into account (not just metrics),
+        especially:
+          * WARN_IEC_NOTCH_INVALID (and FAIL_IEC_NOTCH_INVALID if ever used)
+          * WARN_BASELINE_DRIFT / FAIL_BASELINE_DRIFT (both forms)
+      - Aligns drift thresholds with the dataset-aligned gating:
+          WARN if drift >= 0.60 mV
+          FAIL if drift >= 2.00 mV (extreme)
+    """
+
+    m = qc_out.get("metrics", {}) or {}
+    warnings = qc_out.get("warnings", []) or []
+
+    # ---- Collect codes (robust) ----
+    codes = set()
+    for w in warnings:
+        if isinstance(w, dict):
+            c = str(w.get("code", "") or "")
+            if c:
+                codes.add(c)
+
+    # ---- Notch invalid: dataset expects WARN (even if signal is otherwise clean) ----
+    if ("WARN_IEC_NOTCH_INVALID" in codes) or ("FAIL_IEC_NOTCH_INVALID" in codes):
+        return "WARN"
+
+    # ---- Baseline drift codes handling (covers WARN_ and FAIL_ forms) ----
+    if "WARN_BASELINE_DRIFT" in codes:
+        return "WARN"
+    # FAIL_BASELINE_DRIFT is handled below with metric threshold, but if present and not extreme -> WARN
+    strict_fail_drift = ("FAIL_BASELINE_DRIFT" in codes)
+
+    # ---- Metrics (fallback / main policy) ----
+    snr = float(m.get("snr_med", 0.0) or 0.0)
+
+    # Prefer RAW drift if available; fallback to filtered
+    drift = m.get("raw_baseline_drift_mv", None)
+    if drift is None:
+        drift = m.get("baseline_drift_mv", 0.0)
+    drift = float(drift or 0.0)
+
+    dropout = m.get("dropout", {}) or {}
+    max_drop = float(dropout.get("max_flat_run_ms", 0.0) or 0.0)
+
+    constant = m.get("constant_leads", []) or []
+
+    # Dataset-aligned drift thresholds (match your strict drift gating)
+    BW_WARN_MV = 0.60
+    BW_FAIL_MV = 2.00
+
+    # ---- FAIL rules ----
+    if constant:
+        return "FAIL"
+
+    if max_drop >= 300.0:
+        return "FAIL"
+
+    if snr < 4.0:
+        return "FAIL"
+
+    # Baseline drift: FAIL only when extreme
+    if drift >= BW_FAIL_MV:
+        return "FAIL"
+
+    # If strict emitted FAIL_BASELINE_DRIFT but metric isn't extreme, degrade to WARN
+    if strict_fail_drift:
+        return "WARN"
+
+    # ---- WARN rules ----
+    if snr < 10.0:
+        return "WARN"
+
+    if drift >= BW_WARN_MV:
+        return "WARN"
+
+    return "PASS"
+
+# TERMINUS DU CODE QC.PY
+
+
