@@ -113,38 +113,65 @@ CLINICAL_WARN_CODES = {
     "WARN_QTC_SHORT",
     "WARN_QTC_PROLONGED",
     "WARN_QTC_HIGH_RISK",
+    "WARN_QRS_WIDE",
 }
+
 
 def compute_strict(status: str, warnings: List[Dict[str, Any]]) -> str:
     """
     Strict QC gate = signal quality only.
-    Clinical warnings (QTc, etc.) do NOT degrade strict status.
+    Clinical warnings do NOT degrade strict status.
+    FAIL always wins if any technical FAIL_* appears in warnings.
     """
-    if status == "FAIL":
+    # Hard fail always wins
+    if str(status).upper() == "FAIL":
         return "FAIL"
+
     tech_warn = False
+
     for w in warnings or []:
-        code = (w or {}).get("code", "")
+        if not isinstance(w, dict):
+            continue
+
+        code = str(w.get("code", "")).strip()
+        sev = str(w.get("severity", "")).upper().strip()
+
+        if not code:
+            continue
+
+        # Ignore clinical warnings in strict gate
         if code in CLINICAL_WARN_CODES:
             continue
-        if code.startswith("WARN_"):
+
+        # Any technical FAIL should fail strict gate
+        if code.startswith("FAIL_") or sev == "FAIL":
+            return "FAIL"
+
+        # Any technical WARN should downgrade to WARN
+        if code.startswith("WARN_") or sev == "WARN":
             tech_warn = True
+
     return "WARN" if tech_warn else "PASS"
+
 
 
 def _compute_status_strict_from_warnings(warnings: List[Dict[str, Any]]) -> str:
     """
     Strict QC gate = signal quality only.
-    Clinical warnings (QTc, etc.) do NOT degrade strict status.
+    Clinical warnings do NOT degrade strict status.
+    FAIL always wins if any technical FAIL_* appears.
     """
     status = "PASS"
 
-    for w in warnings:
+    for w in warnings or []:
         if not isinstance(w, dict):
             continue
 
-        code = str(w.get("code", ""))
-        severity = str(w.get("severity", "")).upper()
+        code = str(w.get("code", "")).strip()
+        severity = str(w.get("severity", "")).upper().strip()
+
+        if not code:
+            continue
 
         if code in CLINICAL_WARN_CODES:
             continue
@@ -156,6 +183,7 @@ def _compute_status_strict_from_warnings(warnings: List[Dict[str, Any]]) -> str:
             status = "WARN"
 
     return status
+
 
 
 
@@ -2228,15 +2256,24 @@ def qc_signal_from_leads(
         if max_run_ms >= 300.0:
             _flag(warnings, reasons, "FAIL_SIGNAL_DROPOUT", f"Detected flat/dropout segment ~{max_run_ms:.0f} ms.", "FAIL")
             status = "FAIL"
-        elif frac_flat >= 0.20 or frac_zero >= 0.20:
-            _flag(
-                warnings,
-                reasons,
-                "WARN_SIGNAL_DROPOUT",
-                f"Suspicious flatness (flat_diffs={frac_flat:.2%}, near_zero={frac_zero:.2%}).",
-                "WARN",
-            )
-            status = _worse_status(status, "WARN")
+        else:
+            # IEC HARDENED: reduce false positives on clean signals
+            # - flat_diffs alone can be high on quantized/plateau segments
+            # - require stronger evidence (long run, high near-zero, or extreme flatness)
+            warn_flat_diffs = (frac_flat >= 0.60)
+            warn_long_run  = (max_run_ms >= 250.0)
+            warn_near_zero = (frac_zero >= 0.20)
+
+            if warn_long_run or warn_near_zero or warn_flat_diffs:
+                _flag(
+                    warnings,
+                    reasons,
+                    "WARN_SIGNAL_DROPOUT",
+                    f"Suspicious flatness (flat_diffs={frac_flat:.2%}, near_zero={frac_zero:.2%}, max_run_ms={max_run_ms:.0f}).",
+                    "WARN",
+                )
+                status = _worse_status(status, "WARN")
+
 
     # ---------------- SNR / baseline drift / noise RMS (INTERNAL fs) ----------------
     noise_rms_uv = None
@@ -2294,13 +2331,14 @@ def qc_signal_from_leads(
     limb_consistency_err = _limb_consistency_error(leads_proc, fs_internal)
     best_hyp, best_err, normal_err = _infer_limb_swap(leads_proc, fs_internal)
 
-    # --- SNR gates ---
+    # --- SNR gates (product-safe strict policy) --- Updated Feb 16th, 2026. After "yes" for "“QC gate” = sécurité IA / démo médicale responsable."
+    # Decision: FAIL if SNR < 4.0 ; WARN if 4.0 <= SNR < 5.0
     try:
         snr_val = float(snr_med)
     except Exception:
         snr_val = 0.0
 
-    if snr_val < 2.0:
+    if snr_val < 4.0:
         _flag(warnings, reasons, "FAIL_LOW_SNR", f"SNR too low ({snr_val:.1f}).", "FAIL")
         status = "FAIL"
     elif snr_val < 5.0:
