@@ -1,0 +1,9 @@
+﻿torch
+torchvision
+torchaudio
+transformers
+accelerate
+safetensors
+sentencepiece
+huggingface_hub
+tqdm

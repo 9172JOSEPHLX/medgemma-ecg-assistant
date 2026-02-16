@@ -1,0 +1,3 @@
+﻿pytest==9.0.2
+black==26.1.0
+matplotlib==3.10.8
