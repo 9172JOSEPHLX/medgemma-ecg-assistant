@@ -27,3 +27,6 @@ Thumbs.db
 
 # Build artifacts / generated outputs
 data/
+
+# Legacy local freezes
+requirements-py310-or-legacy-freeze.txt
