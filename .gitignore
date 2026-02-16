@@ -19,3 +19,11 @@ Thumbs.db
 
 # notebooks checkpoints
 .ipynb_checkpoints/
+
+# Python virtual envs (local)
+.venv-kaggle-py312/
+.venv*/
+**/.venv*/
+
+# Build artifacts / generated outputs
+data/

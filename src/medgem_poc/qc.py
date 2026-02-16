@@ -1,6 +1,10 @@
 # qc.py  Version du 06.02.2026 ENRICHI DES BLOCS “QC Normes/Clinique/Mesures”
 
 from __future__ import annotations
+from medgem_poc.resample_to_500 import resample_leads_to_500hz, TARGET_FS_HZ
+# NOTE: resampling helper lives at:
+# from medgem_poc.resample_to_500 import resample_leads_to_500hz, TARGET_FS_HZ
+
 
 from dataclasses import dataclass, asdict, field
 from typing import List, Dict, Any, Optional, Tuple, Literal, Mapping
@@ -18,7 +22,7 @@ except Exception:
 
 
 # =============================================================================
-# 0) QC SIGNAL / "CLINICAL" (durci) — PASS/WARN/FAIL + flags code+reason
+# 0) QC SIGNAL CONSTANTES / "CLINICAL" (durci) — PASS/WARN/FAIL + flags code+reason
 # =============================================================================
 
 QC_VERSION = "1.1.1"
@@ -101,6 +105,58 @@ def _flag(*args):
                 reasons.append(code)
         except Exception:
             pass
+
+# ----------------------------------------------------------------------
+# Clinical warnings: visible but do NOT degrade technical QC gate
+# ----------------------------------------------------------------------
+CLINICAL_WARN_CODES = {
+    "WARN_QTC_SHORT",
+    "WARN_QTC_PROLONGED",
+    "WARN_QTC_HIGH_RISK",
+}
+
+def compute_strict(status: str, warnings: List[Dict[str, Any]]) -> str:
+    """
+    Strict QC gate = signal quality only.
+    Clinical warnings (QTc, etc.) do NOT degrade strict status.
+    """
+    if status == "FAIL":
+        return "FAIL"
+    tech_warn = False
+    for w in warnings or []:
+        code = (w or {}).get("code", "")
+        if code in CLINICAL_WARN_CODES:
+            continue
+        if code.startswith("WARN_"):
+            tech_warn = True
+    return "WARN" if tech_warn else "PASS"
+
+
+def _compute_status_strict_from_warnings(warnings: List[Dict[str, Any]]) -> str:
+    """
+    Strict QC gate = signal quality only.
+    Clinical warnings (QTc, etc.) do NOT degrade strict status.
+    """
+    status = "PASS"
+
+    for w in warnings:
+        if not isinstance(w, dict):
+            continue
+
+        code = str(w.get("code", ""))
+        severity = str(w.get("severity", "")).upper()
+
+        if code in CLINICAL_WARN_CODES:
+            continue
+
+        if code.startswith("FAIL_") or severity == "FAIL":
+            return "FAIL"
+
+        if code.startswith("WARN_") or severity == "WARN":
+            status = "WARN"
+
+    return status
+
 
 
 def _normalize_sex(patient_sex: Any) -> str:
@@ -1798,14 +1854,12 @@ def save_qc_report_json(path: str, report: dict[str, Any]) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
 
-# ===========================================================================================
+# =============================================================================================================
 # Fi2 — qc_signal_from_leads (arrays) : stable + utile pour run_qc_on_csv.py Version 090226
 # Updated 090226 — IEC gate (Fs/noise/drift), constant-lead check, filter warn dedup
-# # UPDATED le 11/02/2026 12H26
-# ===========================================================================================
-
-from typing import Mapping, Dict, Any, List, Optional
-import numpy as np
+# # UPDATED le 11/02/2026 12H26  le 13/02/2026 21H45
+# IEC HARDENED le 15/02/2026 — iec_profile traceability + global warn dedup + strict gate clarity 1864 ligne
+# =============================================================================================================
 
 def qc_signal_from_leads(
     leads: Mapping[str, np.ndarray],
@@ -1818,12 +1872,21 @@ def qc_signal_from_leads(
     """
     Fi2: QC "signal" depuis arrays de leads.
     Retour dict contract-ready shape:
-      {status, reasons, warnings[{code,reason, (severity)}], metrics{...}}
+      {status, reasons, warnings[{code,reason,(severity)}], metrics{...}}
 
     IEC Normalisation:
       - appliquée AVANT toute mesure si iec_normalize=True
       - warnings du filtre remontent dans warnings + reasons
       - IEC est appliqué au niveau des leads (pas uniquement sur x) pour éviter toute incohérence.
+
+    Sampling strategy:
+      - Keep fs_source (input) for traceability + source gating
+      - Standardize internally to TARGET_FS_HZ (500 Hz) for QC computations (PRE only here)
+
+    IEC HARDENED:
+      - Add explicit iec_profile (traceability + compliance narrative)
+      - Global warnings dedup by code at the end (not only IEC filter warnings)
+      - Keep "status_strict" as product gate; "status_dataset_aligned" for dataset mapping
     """
     warnings: List[Dict[str, str]] = []
     reasons: List[str] = []
@@ -1831,27 +1894,68 @@ def qc_signal_from_leads(
 
     if not leads:
         _flag(warnings, reasons, "FAIL_NO_SIGNAL", "No leads found in CSV.", "FAIL")
-        return {"status": "FAIL", "reasons": list(dict.fromkeys(reasons)), "warnings": warnings, "metrics": {}}
+        return {
+            "status": "FAIL",
+            "status_strict": "FAIL",
+            "status_dataset_aligned": "FAIL",
+            "reasons": list(dict.fromkeys(reasons)),
+            "warnings": warnings,
+            "metrics": {},
+        }
 
     # ---------------- normalize sex + fs early ----------------
     sex_in = str(patient_sex).upper().strip() if patient_sex is not None else "U"
     sex = _normalize_sex(sex_in if sex_in in ("M", "F", "U") else "U")
 
-    fs = float(fs_hz) if _is_finite(fs_hz) and float(fs_hz) > 0 else 500.0
+    # fs_source: sampling rate of incoming data (traceability + source gating)
+    fs_source = float(fs_hz) if _is_finite(fs_hz) and float(fs_hz) > 0 else float(TARGET_FS_HZ)
 
     # We'll build metrics progressively
     metrics: Dict[str, Any] = {
-        "fs_hz": float(fs),
+        # Backward compatibility: fs_hz will become internal fs after resampling
+        "fs_hz": None,
+        "fs_source_hz": float(fs_source),
         "iec_band": "0.05-150Hz",
+        "sampling": {},
+        # IEC hardened: explicit compliance profile (filled progressively)
+        "iec_profile": {
+            "reference": "IEC 60601-2-25 (signal acquisition & diagnostic ECG requirements)",
+            "fs_source_hz": float(fs_source),
+            "fs_min_hz": 250.0,
+            "fs_recommended_hz": 500.0,
+            "fs_internal_hz": None,          # set after resample
+            "bandpass_hz": [0.05, 150.0],
+            "notch_hz": None,                # set after validation
+            "normalize_requested": bool(iec_normalize),
+            "normalize_applied": False,      # set after _iec_normalize_leads
+            "notes": [
+                "Fs<250Hz => FAIL (IEC minimum). 250-499Hz => WARN (recommended 500Hz).",
+                "Noise RMS target <30µV (WARN >30µV, FAIL >50µV).",
+                "Baseline wander gate based on robust drift estimate (WARN >=0.60mV, FAIL >=2.00mV).",
+            ],
+        },
     }
 
-    # ---------------- IEC gate: Fs ----------------
-    # IEC/AHA: Fs >= 250 Hz minimum; 500 Hz recommended for diagnostic.
-    if fs < 250.0:
-        _flag(warnings, reasons, "FAIL_FS_TOO_LOW", f"Sampling rate too low ({fs:.1f} Hz).", "FAIL")
-        return {"status": "FAIL", "reasons": list(dict.fromkeys(reasons)), "warnings": warnings, "metrics": metrics}
-    elif fs < 500.0:
-        _flag(warnings, reasons, "WARN_FS_BELOW_RECOMMENDED", f"Sampling rate below recommended 500 Hz ({fs:.1f} Hz).", "WARN")
+    # ---------------- IEC gate: Fs (SOURCE) ----------------
+    # IEC/AHA: Fs >= 250 Hz minimum; 500 Hz commonly used for diagnostic precision.
+    if fs_source < 250.0:
+        _flag(warnings, reasons, "FAIL_FS_TOO_LOW", f"Sampling rate too low ({fs_source:.1f} Hz).", "FAIL")
+        return {
+            "status": "FAIL",
+            "status_strict": "FAIL",
+            "status_dataset_aligned": "FAIL",
+            "reasons": list(dict.fromkeys(reasons)),
+            "warnings": warnings,
+            "metrics": metrics,
+        }
+    elif fs_source < 500.0:
+        _flag(
+            warnings,
+            reasons,
+            "WARN_FS_BELOW_RECOMMENDED",
+            f"Sampling rate below recommended 500 Hz ({fs_source:.1f} Hz). Internal standardization to {float(TARGET_FS_HZ):.0f} Hz will be applied.",
+            "WARN",
+        )
         status = _worse_status(status, "WARN")
 
     # --- Baseline drift estimator (shared; used for per-lead raw/post-IEC drift maps) ---
@@ -1885,21 +1989,19 @@ def qc_signal_from_leads(
         except Exception:
             return None
 
-    # --- RAW baseline drift per-lead (pre-IEC) + conservative aggregation (MAX) ---
-    # Rationale: dataset may inject drift on a single lead; using lead_used (e.g., II) can miss it.
+    # --- RAW baseline drift per-lead (pre-IEC) computed on SOURCE ---
     raw_baseline_drift_mv_by_lead: Dict[str, float] = {}
     for lname, sig in (leads or {}).items():
-        d = _drift_mv_one_lead(sig, float(fs))
+        d = _drift_mv_one_lead(sig, float(fs_source))
         if d is not None and np.isfinite(d):
             raw_baseline_drift_mv_by_lead[str(lname)] = float(d)
     raw_baseline_drift_mv = max(raw_baseline_drift_mv_by_lead.values()) if raw_baseline_drift_mv_by_lead else None
 
     # --- notch_hz validation (must be independent of iec_normalize) ---
-    # Dataset expects WARN when notch_hz is invalid (not 50/60). Do NOT crash; disable notch.
     notch_invalid = False
     try:
         if notch_hz is None:
-            notch_invalid = False  # explicit disable => OK
+            notch_invalid = False
         else:
             nhz = float(notch_hz)
             if (not np.isfinite(nhz)) or (nhz not in (50.0, 60.0)):
@@ -1916,23 +2018,75 @@ def qc_signal_from_leads(
             "WARN",
         )
         status = _worse_status(status, "WARN")
-        notch_hz = None  # sanitize for downstream (IEC or not)
+        notch_hz = None
 
+    # IEC hardened: record notch decision early
+    metrics["iec_profile"]["notch_hz"] = float(notch_hz) if (notch_hz is not None and _is_finite(notch_hz)) else None
+
+    # ============================================================================
+    # Internal standardization to TARGET_FS_HZ (PRE only)
+    # ============================================================================
+    try:
+        leads_raw_500, rs_contract, rs_meta = resample_leads_to_500hz(leads, fs_source, prefer_polyphase=True)
+    except Exception as e:
+        _flag(warnings, reasons, "FAIL_RESAMPLE_INTERNAL", f"Internal resampling to {float(TARGET_FS_HZ):.0f} Hz failed: {e}", "FAIL")
+        return {
+            "status": "FAIL",
+            "status_strict": "FAIL",
+            "status_dataset_aligned": "FAIL",
+            "reasons": list(dict.fromkeys(reasons)),
+            "warnings": warnings,
+            "metrics": metrics,
+        }
+
+    fs_internal = float(getattr(rs_contract, "fs_internal_hz", TARGET_FS_HZ)) if rs_contract is not None else float(TARGET_FS_HZ)
+    if not _is_finite(fs_internal) or fs_internal <= 0:
+        fs_internal = float(TARGET_FS_HZ)
+
+    # Attach sampling contract to metrics
+    metrics["sampling"] = {
+        "fs_source_hz": getattr(rs_contract, "fs_source_hz", None),
+        "fs_internal_hz": float(fs_internal),
+        "target_fs_hz": float(TARGET_FS_HZ),
+        "resample_applied": bool(getattr(rs_contract, "resample_applied", False)),
+        "resample_method": str(getattr(rs_contract, "resample_method", "unknown")),
+        "resample_ratio": getattr(rs_contract, "resample_ratio", None),
+        "fs_low_warning": bool(getattr(rs_contract, "fs_low_warning", False)),
+        "notes": getattr(rs_contract, "notes", None),
+        "per_lead": (rs_meta or {}).get("per_lead", {}),
+    }
+
+    # Backward compatibility: fs_hz now reflects INTERNAL fs used for QC measures
+    metrics["fs_hz"] = float(fs_internal)
+
+    # IEC hardened: record internal fs
+    metrics["iec_profile"]["fs_internal_hz"] = float(fs_internal)
+
+    # Basic sanity: resample must output something usable
+    if not leads_raw_500:
+        _flag(warnings, reasons, "FAIL_NO_SIGNAL", "No usable leads after internal resampling.", "FAIL")
+        return {
+            "status": "FAIL",
+            "status_strict": "FAIL",
+            "status_dataset_aligned": "FAIL",
+            "reasons": list(dict.fromkeys(reasons)),
+            "warnings": warnings,
+            "metrics": metrics,
+        }
 
     # -------- IEC normalisation (bandpass + optional notch) BEFORE MEASURES --------
-    leads_proc: Mapping[str, np.ndarray] = leads
+    leads_proc: Mapping[str, np.ndarray] = leads_raw_500
     iec_applied = False
     iec_filter_metrics: Dict[str, Any] = {}
 
     if iec_normalize:
-        filtered, w, f_metrics = _iec_normalize_leads(leads, fs, notch_hz=notch_hz)
+        filtered, w, f_metrics = _iec_normalize_leads(leads_raw_500, fs_internal, notch_hz=notch_hz)
 
-        # adopt filtered leads if any
         if isinstance(filtered, dict) and len(filtered) > 0:
             leads_proc = filtered
             iec_applied = True
 
-        # propagate warnings into contract output (DEDUP by code)
+        # propagate IEC warnings (DEDUP by code locally)
         seen_codes = set()
         if isinstance(w, list):
             for ww in w:
@@ -1958,16 +2112,19 @@ def qc_signal_from_leads(
 
         iec_filter_metrics = f_metrics if isinstance(f_metrics, dict) else {}
 
-    # --- POST-IEC baseline drift per-lead (optional, for reporting) ---
+    # IEC hardened: record normalization actual
+    metrics["iec_profile"]["normalize_applied"] = bool(iec_applied)
+
+    # --- POST-IEC baseline drift per-lead (for reporting) in INTERNAL fs ---
     baseline_drift_mv_by_lead: Dict[str, float] = {}
     for lname, sig in (leads_proc or {}).items():
-        d = _drift_mv_one_lead(sig, float(fs))
+        d = _drift_mv_one_lead(sig, float(fs_internal))
         if d is not None and np.isfinite(d):
             baseline_drift_mv_by_lead[str(lname)] = float(d)
     baseline_drift_mv = max(baseline_drift_mv_by_lead.values()) if baseline_drift_mv_by_lead else None
 
     # ---------------------------------------------------------------------------
-    # Pick a representative lead for timing/SNR metrics (from leads_proc)
+    # Pick representative lead for QC metrics (INTERNAL fs)
     x = None
     pick = None
     for k in ("II", "I", "V5", "V2", "V1", "III"):
@@ -1975,31 +2132,35 @@ def qc_signal_from_leads(
             x = np.asarray(leads_proc[k], dtype=np.float32)
             pick = k
             break
-
     if x is None:
         for k, v in leads_proc.items():
             if v is not None and len(v) > 10:
                 x = np.asarray(v, dtype=np.float32)
                 pick = k
                 break
-
     if x is None:
         _flag(warnings, reasons, "FAIL_NO_SIGNAL", "No usable lead arrays found.", "FAIL")
-        return {"status": "FAIL", "reasons": list(dict.fromkeys(reasons)), "warnings": warnings, "metrics": metrics}
+        return {
+            "status": "FAIL",
+            "status_strict": "FAIL",
+            "status_dataset_aligned": "FAIL",
+            "reasons": list(dict.fromkeys(reasons)),
+            "warnings": warnings,
+            "metrics": metrics,
+        }
 
-    # Prefer RAW lead for dropout/baseline detection (pre-IEC), when available
+    # Prefer RAW (pre-IEC) pick lead for dropout checks, but still in INTERNAL fs space
     x_raw = None
     try:
-        if pick is not None and pick in leads and leads[pick] is not None and len(leads[pick]) > 10:
-            x_raw = np.asarray(leads[pick], dtype=np.float32)
+        if pick is not None and pick in leads_raw_500 and leads_raw_500[pick] is not None and len(leads_raw_500[pick]) > 10:
+            x_raw = np.asarray(leads_raw_500[pick], dtype=np.float32)
     except Exception:
         x_raw = None
 
-    # ---------------- Constant/zero lead detection across leads (RAW) ----------------
-    def _lead_is_constant(y: np.ndarray, eps_std: float = 1e-6, eps0: float = 1e-4) -> bool:
+    # ---------------- Constant/zero lead detection across leads (SOURCE) ----------------
+    def _lead_is_constant(y: np.ndarray, fs_local: float, eps_std: float = 1e-6, eps0: float = 1e-4) -> bool:
         y = np.asarray(y, dtype=np.float32)
-        # ignore extremely short arrays (<200 ms) to avoid false FAIL
-        if y.size < int(fs * 0.2):
+        if y.size < int(fs_local * 0.2):
             return False
         if not np.isfinite(y).all():
             return True
@@ -2010,7 +2171,6 @@ def qc_signal_from_leads(
 
     bad: List[str] = []
     lead_stats: Dict[str, Any] = {}
-
     if isinstance(leads, dict):
         for k, v in leads.items():
             if v is None:
@@ -2021,22 +2181,21 @@ def qc_signal_from_leads(
             frac_zero = float((np.abs(yy) < 1e-4).mean())
             stdv = float(np.std(yy)) if yy.size > 1 else 0.0
             lead_stats[str(k)] = {"n": int(yy.size), "std": stdv, "frac_zero": frac_zero}
-            if _lead_is_constant(yy):
+            if _lead_is_constant(yy, fs_source):
                 bad.append(str(k))
 
     metrics["lead_stats"] = lead_stats
     metrics["constant_leads"] = bad
-
     if len(bad) >= 1:
         _flag(warnings, reasons, "FAIL_SIGNAL_CONSTANT_LEAD", f"Constant/zero leads detected: {bad}", "FAIL")
         status = "FAIL"
 
-    # ---------------- Dropout / flat segment detection (QC-grade, robust) ----------------
+    # ---------------- Dropout / flat segment detection (INTERNAL timing) ----------------
     x_for_drop = x_raw if x_raw is not None else x
     x0 = np.asarray(x_for_drop, dtype=np.float32)
 
     if x0.size >= 3:
-        eps_dx = 1e-5  # mV per sample threshold for "no change"
+        eps_dx = 1e-5
         dx = np.abs(np.diff(x0))
         is_flat = dx < eps_dx
 
@@ -2050,10 +2209,10 @@ def qc_signal_from_leads(
             else:
                 run = 0
 
-        max_run_ms = (float(max_run + 1) * 1000.0) / fs
+        max_run_ms = (float(max_run + 1) * 1000.0) / fs_internal
         frac_flat = float(is_flat.mean())
 
-        eps0 = 1e-4  # mV
+        eps0 = 1e-4
         frac_zero = float((np.abs(x0) < eps0).mean())
 
         metrics["dropout"] = {
@@ -2079,16 +2238,13 @@ def qc_signal_from_leads(
             )
             status = _worse_status(status, "WARN")
 
-    # ---------------- SNR / baseline drift / noise RMS (QC-only) ----------------
-    # Accept both function signatures:
-    #   old: (snr, drift, filter_strength)
-    #   new: (snr, drift, filter_strength, noise_rms_uv)
+    # ---------------- SNR / baseline drift / noise RMS (INTERNAL fs) ----------------
     noise_rms_uv = None
     baseline_drift_mv_pick = None
     filter_strength = 0.0
 
     try:
-        out = _robust_snr_and_baseline(x, fs)
+        out = _robust_snr_and_baseline(x, fs_internal)
         if isinstance(out, tuple) and len(out) == 4:
             snr_med, baseline_drift_mv_pick, filter_strength, noise_rms_uv = out
         else:
@@ -2097,7 +2253,6 @@ def qc_signal_from_leads(
         snr_med, baseline_drift_mv_pick, filter_strength = 0.0, None, 0.0
         noise_rms_uv = None
 
-    # Noise RMS gates (IEC-ish)
     if noise_rms_uv is not None and _is_finite(noise_rms_uv):
         metrics["noise_rms_uv"] = float(noise_rms_uv)
         if float(noise_rms_uv) > 50.0:
@@ -2109,38 +2264,37 @@ def qc_signal_from_leads(
     else:
         metrics["noise_rms_uv"] = None
 
-    # Optional: RAW baseline drift on the picked lead (debug only; does NOT override raw max-by-lead)
     raw_baseline_drift_mv_pick = None
     if x_raw is not None:
         try:
-            out_raw = _robust_snr_and_baseline(x_raw, fs)
+            out_raw = _robust_snr_and_baseline(x_raw, fs_internal)
             if isinstance(out_raw, tuple) and len(out_raw) >= 2:
                 raw_baseline_drift_mv_pick = float(out_raw[1])
         except Exception:
             raw_baseline_drift_mv_pick = None
 
-    # RR/HR from R peaks
-    peaks = _detect_r_peaks(x, fs)
+    # RR/HR (INTERNAL)
+    peaks = _detect_r_peaks(x, fs_internal)
     rr_ms = None
     hr_bpm = None
     if getattr(peaks, "size", 0) >= 2:
-        rr_ms = float(np.median(np.diff(peaks)) * 1000.0 / fs)
+        rr_ms = float(np.median(np.diff(peaks)) * 1000.0 / fs_internal)
         if rr_ms > 0:
             hr_bpm = float(60000.0 / rr_ms)
 
-    # intervals
-    qrs_ms_est, qt_ms_est, pr_ms_est = _estimate_intervals_ms(x, fs)
+    # intervals (INTERNAL)
+    qrs_ms_est, qt_ms_est, pr_ms_est = _estimate_intervals_ms(x, fs_internal)
 
     # qtc
     qtc_ms_est = None
     if _is_finite(qt_ms_est) and _is_finite(rr_ms):
         qtc_ms_est = _calc_qtc_bazett(float(qt_ms_est), float(rr_ms))
 
-    # limb consistency + swap (use IEC-normalized leads if enabled)
-    limb_consistency_err = _limb_consistency_error(leads_proc, fs)
-    best_hyp, best_err, normal_err = _infer_limb_swap(leads_proc, fs)
+    # limb consistency + swap (INTERNAL, post-IEC)
+    limb_consistency_err = _limb_consistency_error(leads_proc, fs_internal)
+    best_hyp, best_err, normal_err = _infer_limb_swap(leads_proc, fs_internal)
 
-    # --- SNR gates (PoC) ---
+    # --- SNR gates ---
     try:
         snr_val = float(snr_med)
     except Exception:
@@ -2153,11 +2307,9 @@ def qc_signal_from_leads(
         _flag(warnings, reasons, "WARN_LOW_SNR", f"SNR marginal ({snr_val:.1f}).", "WARN")
         status = _worse_status(status, "WARN")
 
-    # --- baseline drift gating (dataset-aligned thresholds) ---
+    # --- baseline drift gating ---
     BW_WARN_MV = 0.60
-    BW_FAIL_MV = 2.00  # FAIL only for extreme drift
-
-    # IMPORTANT: raw_baseline_drift_mv must be the MAX-by-lead computed earlier (pre-IEC)
+    BW_FAIL_MV = 2.00
     drift_for_gate = raw_baseline_drift_mv if _is_finite(raw_baseline_drift_mv) else baseline_drift_mv
     if _is_finite(drift_for_gate):
         d = float(drift_for_gate)
@@ -2212,7 +2364,6 @@ def qc_signal_from_leads(
                 status = "WARN"
                 break
 
-    # finalize metrics (keep drift max-by-lead + debug pick values)
     metrics.update(
         {
             "hr_bpm": hr_bpm,
@@ -2222,34 +2373,60 @@ def qc_signal_from_leads(
             "qt_ms_est": qt_ms_est,
             "qtc_ms_est": qtc_ms_est,
             "snr_med": float(snr_med) if _is_finite(snr_med) else None,
-
-            # Drift scalars: prefer max-by-lead (raw + post-IEC)
             "baseline_drift_mv": float(baseline_drift_mv) if _is_finite(baseline_drift_mv) else None,
             "raw_baseline_drift_mv": float(raw_baseline_drift_mv) if _is_finite(raw_baseline_drift_mv) else None,
-
-            # Optional debug: drift maps + picked-lead drift values
             "baseline_drift_mv_by_lead": baseline_drift_mv_by_lead if "baseline_drift_mv_by_lead" in locals() else None,
             "raw_baseline_drift_mv_by_lead": raw_baseline_drift_mv_by_lead if "raw_baseline_drift_mv_by_lead" in locals() else None,
             "baseline_drift_mv_pick": float(baseline_drift_mv_pick) if _is_finite(baseline_drift_mv_pick) else None,
             "raw_baseline_drift_mv_pick": float(raw_baseline_drift_mv_pick) if _is_finite(raw_baseline_drift_mv_pick) else None,
-
             "filter_strength": float(filter_strength) if _is_finite(filter_strength) else None,
             "limb_consistency_err": float(limb_consistency_err) if limb_consistency_err is not None else None,
             "limb_swap_hypothesis": limb_swap_hypothesis,
             "lead_used": pick,
-
-            # IEC metadata (déjà définis plus haut)
             "iec_normalized": bool(iec_applied),
             "iec_notch_hz": float(notch_hz) if (notch_hz is not None and _is_finite(notch_hz)) else None,
             "iec_filter": iec_filter_metrics,
         }
     )
 
+    # ----------------------------------------------------------------------
+    # IEC HARDENED: Global dedup warnings by "code" (keeps first occurrence)
+    # ----------------------------------------------------------------------
+    deduped: List[Dict[str, str]] = []
+    seen = set()
+    for w in warnings:
+        if not isinstance(w, dict):
+            continue
+        code = str(w.get("code", "")).strip()
+        if not code:
+            code = "WARN_UNSPECIFIED"
+            w["code"] = code
+        if code in seen:
+            continue
+        seen.add(code)
+        # normalize severity key (some callers may omit)
+        if "severity" not in w or not w.get("severity"):
+            if code.startswith("FAIL_"):
+                w["severity"] = "FAIL"
+            elif code.startswith("WARN_"):
+                w["severity"] = "WARN"
+            else:
+                w["severity"] = "WARN"
+        deduped.append(w)
+    warnings = deduped
+
+    # reasons: dedup + stable order
     reasons = list(dict.fromkeys(reasons))
 
+    # ----------------------------------------------------------------------
+    # Compute strict QC gate (signal quality only) — ignores clinical WARN_*
+    # IMPORTANT: compute_strict() must be defined near CLINICAL_WARN_CODES
+    # ----------------------------------------------------------------------
+    status_strict = compute_strict(status, warnings)
+
     dataset_payload = {
-        "status": status,
-        "status_strict": status,
+        "status": status,               # dataset-oriented status (unchanged logic)
+        "status_strict": status_strict, # available for mapping if needed
         "metrics": metrics,
         "warnings": warnings,
         "reasons": reasons,
@@ -2257,87 +2434,168 @@ def qc_signal_from_leads(
     dataset_status = _map_to_dataset_status(dataset_payload)
 
     return {
-        "status": status,  # canonical status (= strict)
-        "status_strict": status,
+        "status": status_strict,        # product gate uses strict
+        "status_strict": status_strict,
         "status_dataset_aligned": dataset_status,
         "reasons": reasons,
         "warnings": warnings,
         "metrics": metrics,
     }
 
-# Terminus du Code "qc_signal_from_leads" UPDATED le 11/02/2026 12H26 et ensuite 12H37
 
+# Inserption Feb 12th, 2026 20H30
 
-# =============================================================================
-# Fi3 — qc_pack_v1 : compatible run_qc_on_csv.py (signal_qc=raw)
-# =============================================================================
-
-def qc_pack_v1(
+def qc_signal_post_from_leads(
+    leads_pred: Mapping[str, np.ndarray],
+    fs_internal_hz: float = 500.0,
     *,
-    input_type: str,
-    source_path: str,
-    sample_id: Optional[str] = None,
-    fs_hz: Optional[float] = None,
-    signal_qc: Optional[Dict[str, Any]] = None,
-    repo: str = "Appli_MedGem_PoC",
-    commit: Optional[str] = None,
-    qc_module: str = "medgem_poc.qc",
-    qc_version: Optional[str] = None,
+    expected_leads: Optional[List[str]] = None,
+    amp_abs_fail_mv: float = 20.0,
+    amp_abs_warn_mv: float = 10.0,
+    constant_std_eps: float = 1e-6,
 ) -> Dict[str, Any]:
     """
-    Fi3: empaquete en 'qc.v1' contract.
-    - Si signal_qc est déjà un objet qc.v1 (schema=qc.v1), on le renvoie tel quel.
-    - Sinon, on extrait {status, reasons, warnings, metrics} depuis signal_qc.
+    QC POST (post-inference): validate MedGemma-generated signals (or any model output).
+    Contract shape:
+      {status, reasons, warnings[{code,reason,severity}], metrics{...}}
+
+    POST philosophy:
+      - fast + defensive: catch degenerate outputs (NaNs/Infs, constants, absurd amplitude, missing leads)
+      - assumes sampling already standardized (default 500 Hz)
     """
-    if isinstance(signal_qc, dict) and signal_qc.get("schema") == "qc.v1":
-        return signal_qc
+    warnings: List[Dict[str, Any]] = []
+    reasons: List[str] = []
+    status = "PASS"
 
-    qc_version = qc_version or QC_VERSION
+    if expected_leads is None:
+        expected_leads = ["I", "II", "III", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6"]
 
-    raw = signal_qc or {}
-    status = raw.get("status", "WARN")
-    reasons = raw.get("reasons", [])
-    warnings = raw.get("warnings", [])
-    metrics = raw.get("metrics", {})
+    fs_internal = float(fs_internal_hz) if np.isfinite(fs_internal_hz) and float(fs_internal_hz) > 0 else 500.0
 
-    # normalize minimal types
-    if not isinstance(reasons, list):
-        reasons = []
-    if not isinstance(warnings, list):
-        warnings = []
-    if not isinstance(metrics, dict):
-        metrics = {}
+    metrics: Dict[str, Any] = {
+        "fs_hz": float(fs_internal),
+        "n_leads_in": int(len(leads_pred) if leads_pred else 0),
+        "lead_stats": {},
+        "missing_leads": [],
+        "post_checks": {
+            "amp_abs_warn_mv": float(amp_abs_warn_mv),
+            "amp_abs_fail_mv": float(amp_abs_fail_mv),
+            "constant_std_eps": float(constant_std_eps),
+        },
+    }
 
-    # ensure warnings codes are included in reasons
-    rset = set([r for r in reasons if isinstance(r, str)])
-    for w in warnings:
-        if isinstance(w, dict) and isinstance(w.get("code"), str):
-            if w["code"] not in rset:
-                reasons.append(w["code"])
-                rset.add(w["code"])
+    if not leads_pred:
+        _flag(warnings, reasons, "FAIL_POST_NO_LEADS", "No predicted leads provided (post-inference).", "FAIL")
+        return {"status": "FAIL", "reasons": list(dict.fromkeys(reasons)), "warnings": warnings, "metrics": metrics}
+
+    # Missing leads (WARN by default)
+    missing = [k for k in expected_leads if k not in leads_pred]
+    if missing:
+        metrics["missing_leads"] = missing
+        _flag(
+            warnings,
+            reasons,
+            "WARN_POST_MISSING_LEADS",
+            f"Missing expected leads in post-inference output: {missing}",
+            "WARN",
+        )
+        status = _worse_status(status, "WARN")
+
+    # Per-lead checks
+    bad_const = []
+    bad_nonfinite = []
+    bad_amp_fail = []
+    bad_amp_warn = []
+
+    for k, v in (leads_pred or {}).items():
+        if v is None:
+            continue
+        x = np.asarray(v, dtype=np.float32).reshape(-1)
+
+        # stats
+        n = int(x.size)
+        if n == 0:
+            continue
+
+        finite_mask = np.isfinite(x)
+        frac_nonfinite = float(1.0 - float(finite_mask.mean()))
+        x_f = x[finite_mask] if finite_mask.any() else np.asarray([], dtype=np.float32)
+
+        stdv = float(np.std(x_f)) if x_f.size > 1 else 0.0
+        maxabs = float(np.max(np.abs(x_f))) if x_f.size > 0 else float("inf")
+
+        metrics["lead_stats"][str(k)] = {
+            "n": n,
+            "std": stdv,
+            "max_abs_mv": maxabs,
+            "frac_nonfinite": frac_nonfinite,
+        }
+
+        # non-finite -> FAIL
+        if frac_nonfinite > 0.0:
+            bad_nonfinite.append(str(k))
+
+        # constant/near-constant -> FAIL
+        if stdv < float(constant_std_eps):
+            bad_const.append(str(k))
+
+        # amplitude sanity
+        if maxabs >= float(amp_abs_fail_mv):
+            bad_amp_fail.append(str(k))
+        elif maxabs >= float(amp_abs_warn_mv):
+            bad_amp_warn.append(str(k))
+
+    if bad_nonfinite:
+        _flag(
+            warnings,
+            reasons,
+            "FAIL_POST_NONFINITE",
+            f"Non-finite values (NaN/Inf) detected in leads: {bad_nonfinite}",
+            "FAIL",
+        )
+        status = "FAIL"
+
+    if bad_const:
+        _flag(
+            warnings,
+            reasons,
+            "FAIL_POST_CONSTANT",
+            f"Constant/near-constant predicted leads detected: {bad_const}",
+            "FAIL",
+        )
+        status = "FAIL"
+
+    if bad_amp_fail:
+        _flag(
+            warnings,
+            reasons,
+            "FAIL_POST_AMP_ABS",
+            f"Abs amplitude too high (>= {amp_abs_fail_mv} mV) in leads: {bad_amp_fail}",
+            "FAIL",
+        )
+        status = "FAIL"
+    elif bad_amp_warn:
+        _flag(
+            warnings,
+            reasons,
+            "WARN_POST_AMP_ABS",
+            f"High abs amplitude (>= {amp_abs_warn_mv} mV) in leads: {bad_amp_warn}",
+            "WARN",
+        )
+        status = _worse_status(status, "WARN")
+
+    # ensure FAIL if any FAIL_*
+    if any(str(w.get("code", "")).startswith("FAIL_") for w in warnings if isinstance(w, dict)):
+        status = "FAIL"
 
     return {
-        "schema": "qc.v1",
-        "generated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
-        "input": {
-            "type": input_type,
-            "source_path": source_path,
-            "sample_id": sample_id,
-            "fs_hz": fs_hz,
-        },
-        "pipeline": {
-            "repo": repo,
-            "commit": commit,
-            "qc_module": qc_module,
-            "qc_version": qc_version,
-        },
         "status": status,
-        "reasons": reasons,
+        "reasons": list(dict.fromkeys(reasons)),
         "warnings": warnings,
         "metrics": metrics,
     }
 
-### --- map to dataset status (covers WARN and FAIL forms) ---- ###  Created Feb 10th, 2026 Updated Feb 11th, 2026
+### --- map to dataset status (covers WARN and FAIL forms) ---- ###  Created Feb 10th, 2026 Updated Feb 11th, 13th, 2026
 
 def _map_to_dataset_status(qc_out: Dict[str, Any]) -> str:
     """
@@ -2353,20 +2611,34 @@ def _map_to_dataset_status(qc_out: Dict[str, Any]) -> str:
           WARN if drift >= 0.60 mV
           FAIL if drift >= 2.00 mV (extreme)
     """
-
     m = qc_out.get("metrics", {}) or {}
     warnings = qc_out.get("warnings", []) or []
 
-    # ---- Collect codes (robust) ----
+    # ---- Collect codes (robust / normalized) ----
     codes = set()
+    notch_hint = False  # fallback if warning is not a dict / code missing
+
     for w in warnings:
         if isinstance(w, dict):
-            c = str(w.get("code", "") or "")
+            c_raw = w.get("code", "")
+            c = str(c_raw or "").strip().upper()
             if c:
                 codes.add(c)
 
+            # fallback: sometimes code exists but is weird / empty -> look at reason
+            r = str(w.get("reason", "") or "")
+            if "NOTCH" in r.upper() and "INVALID" in r.upper():
+                notch_hint = True
+
+        else:
+            # warning may be a string or something else
+            s = str(w)
+            su = s.upper()
+            if "NOTCH" in su and "INVALID" in su:
+                notch_hint = True
+
     # ---- Notch invalid: dataset expects WARN (even if signal is otherwise clean) ----
-    if ("WARN_IEC_NOTCH_INVALID" in codes) or ("FAIL_IEC_NOTCH_INVALID" in codes):
+    if ("WARN_IEC_NOTCH_INVALID" in codes) or ("FAIL_IEC_NOTCH_INVALID" in codes) or notch_hint:
         return "WARN"
 
     # ---- Baseline drift codes handling (covers WARN_ and FAIL_ forms) ----
@@ -2376,20 +2648,29 @@ def _map_to_dataset_status(qc_out: Dict[str, Any]) -> str:
     strict_fail_drift = ("FAIL_BASELINE_DRIFT" in codes)
 
     # ---- Metrics (fallback / main policy) ----
-    snr = float(m.get("snr_med", 0.0) or 0.0)
+    try:
+        snr = float(m.get("snr_med", 0.0) or 0.0)
+    except Exception:
+        snr = 0.0
 
     # Prefer RAW drift if available; fallback to filtered
     drift = m.get("raw_baseline_drift_mv", None)
     if drift is None:
         drift = m.get("baseline_drift_mv", 0.0)
-    drift = float(drift or 0.0)
+    try:
+        drift = float(drift or 0.0)
+    except Exception:
+        drift = 0.0
 
     dropout = m.get("dropout", {}) or {}
-    max_drop = float(dropout.get("max_flat_run_ms", 0.0) or 0.0)
+    try:
+        max_drop = float(dropout.get("max_flat_run_ms", 0.0) or 0.0)
+    except Exception:
+        max_drop = 0.0
 
     constant = m.get("constant_leads", []) or []
 
-    # Dataset-aligned drift thresholds (match your strict drift gating)
+    # Dataset-aligned drift thresholds
     BW_WARN_MV = 0.60
     BW_FAIL_MV = 2.00
 
@@ -2419,6 +2700,7 @@ def _map_to_dataset_status(qc_out: Dict[str, Any]) -> str:
         return "WARN"
 
     return "PASS"
+
 
 # TERMINUS DU CODE QC.PY
 
