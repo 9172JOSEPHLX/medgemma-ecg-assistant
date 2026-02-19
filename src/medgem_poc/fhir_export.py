@@ -1,7 +1,8 @@
 # src/medgem_poc/fhir_export.py ### Feb 9th, 2026
 
 # src/medgem_poc/fhir_export.py  ### Updated Feb 16th, 2026 updated 17h16.  (PATCHED Feb 17th, 2026, 17H32)
-#
+#                                ### Updated Feb 19th, 2026 updated 16h45.  (COMMITED Feb 19th, 2026)
+
 # FHIR export (PoC) — QC -> Observation
 # - Robust FHIR status mapping (FAIL -> entered-in-error)
 # - Category + issued timestamps
@@ -17,9 +18,11 @@ from datetime import datetime, timezone
 
 UCUM_SYSTEM = "http://unitsofmeasure.org"
 
-# Stable namespace for your internal QC/derived-metrics codes.
-# TODO: replace "example.org" with your real domain/namespace when available.
-QC_SYSTEM_URI = "http://example.org/medgemma/qc"
+### Stable namespace for your internal QC/derived-metrics codes.
+### TODO: replace "example.org" with your real domain/namespace when available.
+### QC_SYSTEM_URI = "http://example.org/medgemma/qc"
+
+QC_SYSTEM_URI = "https://medgemma.ai/fhir/qc"
 
 # Canonical component codes (stable identifiers)
 C_QC_STATUS_STRICT = "QC_STATUS_STRICT"
