@@ -1,28 +1,67 @@
 # src/medgem_poc/fhir_export.py ### Feb 9th, 2026
 
-# src/medgem_poc/fhir_export.py  ### Updated Feb 16th, 2026 updated 17h16.
+# src/medgem_poc/fhir_export.py  ### Updated Feb 16th, 2026 updated 17h16.  (PATCHED Feb 17th, 2026, 17H32)
 #
 # FHIR export (PoC) — QC -> Observation
-# - Adds robust FHIR status mapping (FAIL -> entered-in-error)
-# - Adds category + issued timestamps
-# - Refines interpretation mapping (PASS=N, WARN=A, FAIL=None)
-# - Keeps UCUM quantities where applicable
+# - Robust FHIR status mapping (FAIL -> entered-in-error)
+# - Category + issued timestamps
+# - Interpretation mapping (PASS=N, WARN=A, FAIL=None)
+# - Uniform component codes with stable coding system (QC_SYSTEM_URI)
+# - UCUM quantities where applicable (including unitless ratios with UCUM code "1")
+# - Product-safe behavior: strict FAIL blocks derived metrics export
 
 from __future__ import annotations
 
 from typing import Any, Dict, Optional, List
 from datetime import datetime, timezone
 
+UCUM_SYSTEM = "http://unitsofmeasure.org"
+
+# Stable namespace for your internal QC/derived-metrics codes.
+# TODO: replace "example.org" with your real domain/namespace when available.
+QC_SYSTEM_URI = "http://example.org/medgemma/qc"
+
+# Canonical component codes (stable identifiers)
+C_QC_STATUS_STRICT = "QC_STATUS_STRICT"
+C_QC_STATUS_DATASET = "QC_STATUS_DATASET_ALIGNED"
+
+C_FS_HZ = "FS_HZ"
+C_HR_BPM = "HR_BPM"
+C_PR_MS = "PR_MS_EST"
+C_QRS_MS = "QRS_MS_EST"
+C_QT_MS = "QT_MS_EST"
+C_QTC_MS = "QTC_BAZETT_MS_EST"
+
+C_SNR_MED = "SNR_MED"  # unitless ratio
+C_NOISE_RMS_UV = "NOISE_RMS_UV"
+C_BASELINE_DRIFT_MV = "BASELINE_DRIFT_MV"
+
+C_LEAD_USED = "LEAD_USED"
+C_LIMB_SWAP_HYPOTHESIS = "LIMB_SWAP_HYPOTHESIS"
+
 
 def _now_iso_z() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def _mk_code(code: str, text: str, *, system: str = QC_SYSTEM_URI) -> Dict[str, Any]:
+    """
+    Build a FHIR CodeableConcept with stable coding + human text.
+    """
+    return {
+        "coding": [{"system": system, "code": code}],
+        "text": text,
+    }
+
+
 def _mk_quantity(value: float, unit: str, ucum_code: str) -> Dict[str, Any]:
+    """
+    Build a FHIR Quantity with UCUM coding.
+    """
     return {
         "value": float(value),
         "unit": unit,
-        "system": "http://unitsofmeasure.org",
+        "system": UCUM_SYSTEM,
         "code": ucum_code,
     }
 
@@ -30,6 +69,7 @@ def _mk_quantity(value: float, unit: str, ucum_code: str) -> Dict[str, Any]:
 def _add_component(
     components: List[Dict[str, Any]],
     *,
+    code: str,
     text: str,
     value: Any,
     unit: Optional[str] = None,
@@ -38,13 +78,15 @@ def _add_component(
     """
     Append a FHIR Observation.component entry.
 
-    If unit+ucum_code are provided, attempts to cast value to float and stores valueQuantity.
-    Otherwise stores valueString. None values are ignored.
+    - Always uses a stable coded CodeableConcept in component.code.
+    - If unit+ucum_code are provided, attempts to cast value to float and stores valueQuantity.
+    - Otherwise stores valueString.
+    - None values are ignored.
     """
     if value is None:
         return
 
-    comp: Dict[str, Any] = {"code": {"text": text}}
+    comp: Dict[str, Any] = {"code": _mk_code(code, text)}
 
     if unit and ucum_code:
         try:
@@ -77,7 +119,7 @@ def qc_to_fhir_observation(
       - interpretation: PASS->N, WARN->A, FAIL->(omitted)
 
     Product-safe behavior:
-      - If strict=FAIL: keep only QC fields (status strict + dataset aligned) + notes.
+      - If strict=FAIL: keep only QC fields + notes.
         Do NOT export physiologic/derived metrics to avoid unsafe reuse.
     """
     # Normalize inputs
@@ -140,34 +182,68 @@ def qc_to_fhir_observation(
             }
         ]
 
-    # Components (always include QC meta; optionally include metrics only if not FAIL)
+    # Components (always include QC meta; include metrics only if not FAIL)
     comps: List[Dict[str, Any]] = []
-    _add_component(comps, text="QC status (strict)", value=status_strict)
-    _add_component(comps, text="QC status (dataset aligned)", value=status_ds)
+
+    _add_component(
+        comps,
+        code=C_QC_STATUS_STRICT,
+        text="QC status (strict)",
+        value=status_strict,
+    )
+    _add_component(
+        comps,
+        code=C_QC_STATUS_DATASET,
+        text="QC status (dataset aligned)",
+        value=status_ds,
+    )
 
     allow_metrics = (status_strict != "FAIL")
 
     if allow_metrics:
-        _add_component(comps, text="Sampling frequency", value=metrics.get("fs_hz"), unit="Hz", ucum_code="Hz")
-        _add_component(comps, text="Heart rate", value=metrics.get("hr_bpm"), unit="beats/min", ucum_code="/min")
+        _add_component(
+            comps,
+            code=C_FS_HZ,
+            text="Sampling frequency",
+            value=metrics.get("fs_hz"),
+            unit="Hz",
+            ucum_code="Hz",
+        )
+        _add_component(
+            comps,
+            code=C_HR_BPM,
+            text="Heart rate",
+            value=metrics.get("hr_bpm"),
+            unit="beats/min",
+            ucum_code="/min",
+        )
 
-        _add_component(comps, text="PR interval", value=metrics.get("pr_ms_est"), unit="ms", ucum_code="ms")
-        _add_component(comps, text="QRS duration", value=metrics.get("qrs_ms_est"), unit="ms", ucum_code="ms")
-        _add_component(comps, text="QT interval", value=metrics.get("qt_ms_est"), unit="ms", ucum_code="ms")
-        _add_component(comps, text="QTc (Bazett)", value=metrics.get("qtc_ms_est"), unit="ms", ucum_code="ms")
+        _add_component(comps, code=C_PR_MS, text="PR interval (estimated)", value=metrics.get("pr_ms_est"), unit="ms", ucum_code="ms")
+        _add_component(comps, code=C_QRS_MS, text="QRS duration (estimated)", value=metrics.get("qrs_ms_est"), unit="ms", ucum_code="ms")
+        _add_component(comps, code=C_QT_MS, text="QT interval (estimated)", value=metrics.get("qt_ms_est"), unit="ms", ucum_code="ms")
+        _add_component(comps, code=C_QTC_MS, text="QTc (Bazett, estimated)", value=metrics.get("qtc_ms_est"), unit="ms", ucum_code="ms")
 
-        _add_component(comps, text="SNR (median)", value=metrics.get("snr_med"))  # ratio (no UCUM)
-        _add_component(comps, text="Noise RMS", value=metrics.get("noise_rms_uv"), unit="uV", ucum_code="uV")
-        _add_component(comps, text="Baseline drift", value=metrics.get("baseline_drift_mv"), unit="mV", ucum_code="mV")
+        # Ratios: UCUM supports unitless as code "1"
+        _add_component(
+            comps,
+            code=C_SNR_MED,
+            text="SNR (median, unitless ratio)",
+            value=metrics.get("snr_med"),
+            unit="1",
+            ucum_code="1",
+        )
 
-        _add_component(comps, text="Lead used", value=metrics.get("lead_used"))
-        _add_component(comps, text="Limb swap hypothesis", value=metrics.get("limb_swap_hypothesis"))
+        _add_component(comps, code=C_NOISE_RMS_UV, text="Noise RMS", value=metrics.get("noise_rms_uv"), unit="uV", ucum_code="uV")
+        _add_component(comps, code=C_BASELINE_DRIFT_MV, text="Baseline drift", value=metrics.get("baseline_drift_mv"), unit="mV", ucum_code="mV")
+
+        _add_component(comps, code=C_LEAD_USED, text="Lead used", value=metrics.get("lead_used"))
+        _add_component(comps, code=C_LIMB_SWAP_HYPOTHESIS, text="Limb swap hypothesis", value=metrics.get("limb_swap_hypothesis"))
 
     obs["component"] = comps
 
     # Notes: warnings + reasons (human-readable)
     note_lines: List[str] = []
-    note_lines.insert(0, f"QC strict={status_strict} | benchmark={status_ds}")
+    note_lines.append(f"QC strict={status_strict} | benchmark={status_ds}")
 
     if reasons:
         note_lines.append("Reasons: " + " | ".join([str(r) for r in reasons]))
@@ -195,3 +271,4 @@ def qc_to_fhir_observation(
 
 
 # Terminus
+
