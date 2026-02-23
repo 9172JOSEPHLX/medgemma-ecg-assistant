@@ -201,6 +201,67 @@ def calc_qtc_bazett(qt_ms: float, rr_ms: float) -> Optional[float]:
         return None
     return float(qt_ms) / math.sqrt(rr_s)
 
+###### ADD FEB 21 TH 2026 10H30 ###### 
+
+import numpy as np
+
+def _corr(a: np.ndarray, b: np.ndarray) -> float:
+    a = np.asarray(a, dtype=np.float32)
+    b = np.asarray(b, dtype=np.float32)
+    n = min(a.size, b.size)
+    if n < 50:
+        return 0.0
+    a = a[:n] - float(np.mean(a[:n]))
+    b = b[:n] - float(np.mean(b[:n]))
+    da = float(np.std(a)) + 1e-6
+    db = float(np.std(b)) + 1e-6
+    return float(np.mean((a/da) * (b/db)))
+
+def _apply_limb_swap(leads, kind: str):
+    I, II, III = leads["I"], leads["II"], leads["III"]
+    aVR, aVL, aVF = leads["aVR"], leads["aVL"], leads["aVF"]
+
+    if kind == "RA_LA":
+        return {"I": -I, "II": III, "III": II, "aVR": aVL, "aVL": aVR, "aVF": aVF}
+    if kind == "RA_LL":
+        return {"I": -III, "II": -II, "III": -I, "aVR": aVF, "aVL": aVL, "aVF": aVR}
+    if kind == "LA_LL":
+        return {"I": II, "II": I, "III": -III, "aVR": aVR, "aVL": aVF, "aVF": aVL}
+
+    return {"I": I, "II": II, "III": III, "aVR": aVR, "aVL": aVL, "aVF": aVF}
+
+def detect_limb_reversal(leads):
+    required = ["I","II","III","aVR","aVL","aVF","V6"]
+    if any(k not in leads for k in required):
+        return {"kind": "NONE", "score_best": 0.0, "score_none": 0.0, "delta": 0.0}
+
+    V6 = leads["V6"]
+    V5 = leads.get("V5", None)
+
+    def score(limb):
+        # key heuristic: after correction, I tends to resemble V6 (lateral)
+        s = max(0.0, _corr(limb["I"], V6))
+        s += 0.5 * max(0.0, _corr(limb["aVL"], V6))
+        if V5 is not None:
+            s += 0.25 * max(0.0, _corr(limb["I"], V5))
+        return float(s)
+
+    none = _apply_limb_swap(leads, "NONE")
+    score_none = score(none)
+
+    best_kind, best_score = "NONE", score_none
+    for kind in ("RA_LA", "RA_LL", "LA_LL"):
+        limb = _apply_limb_swap(leads, kind)
+        sc = score(limb)
+        if sc > best_score:
+            best_kind, best_score = kind, sc
+
+    return {
+        "kind": best_kind,
+        "score_best": float(best_score),
+        "score_none": float(score_none),
+        "delta": float(best_score - score_none),
+    }
 
 def qc_signal(metrics: Dict[str, Any], patient_sex: Any = "M") -> Dict[str, Any]:
     """
@@ -2426,6 +2487,33 @@ def qc_signal_from_leads(
             "iec_filter": iec_filter_metrics,
         }
     )
+
+    # --- Limb electrode reversal suspicion (Option B) ---
+    try:
+        rev = detect_limb_reversal(leads)
+        metrics["limb_swap_kind"]  = rev["kind"]
+        metrics["limb_swap_score"] = rev["score_best"]
+        metrics["limb_swap_delta"] = rev["delta"]
+
+        if rev["kind"] != "NONE":
+            # Conservative gating (avoid false positives)
+            if rev["score_best"] >= 0.60 and rev["delta"] >= 0.25:
+                status_strict = "FAIL"
+                reasons.append(f"Suspected limb electrode reversal ({rev['kind']}) high-confidence.")
+                warnings.append({
+                    "code": "FAIL_LIMB_LEAD_REVERSAL_SUSPECTED",
+                    "reason": f"Limb electrode reversal suspected: {rev['kind']} (score={rev['score_best']:.2f}, delta={rev['delta']:.2f}).",
+                    "severity": "high"
+                })
+            elif rev["score_best"] >= 0.45 and rev["delta"] >= 0.15:
+                warnings.append({
+                    "code": "WARN_LIMB_LEAD_REVERSAL_POSSIBLE",
+                    "reason": f"Possible limb lead reversal: {rev['kind']} (score={rev['score_best']:.2f}, delta={rev['delta']:.2f}).",
+                    "severity": "medium"
+                })
+    except Exception:
+        # keep QC robust: never crash on limb reversal heuristic
+        pass
 
     # ----------------------------------------------------------------------
     # IEC HARDENED: Global dedup warnings by "code" (keeps first occurrence)
