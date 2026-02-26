@@ -1913,11 +1913,13 @@ def load_leads_from_csv(path: str) -> tuple[dict[str, np.ndarray], float]:
 
     arr = np.array(rows, dtype=np.float32)
     cols = {name: i for i, name in enumerate(header)}
+    cols_l = {str(name).strip().lower(): i for name, i in cols.items()}
 
     time_idx = None
-    for k in ["t", "time", "sec", "seconds"]:
-        if k in cols:
-            time_idx = cols[k]
+    # Many demo CSVs use "time_s" (seconds). Treat it as time axis, not an ECG lead.
+    for k in ("t", "time", "time_s", "time_ms", "sec", "secs", "second", "seconds"):
+        if k in cols_l:
+            time_idx = cols_l[k]
             break
 
     leads: dict[str, np.ndarray] = {}
