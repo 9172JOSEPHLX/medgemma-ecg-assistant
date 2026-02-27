@@ -49,6 +49,50 @@ def test_loader_ignores_time_s_column_and_keeps_fs_guess(tmp_path: Path) -> None
     assert fs == 500.0
 
 
+def test_loader_accepts_timestamp_column_via_wildcard_and_validates_monotone(tmp_path: Path) -> None:
+    from medgem_poc.qc import load_leads_from_csv
+
+    p = tmp_path / "mini_timestamp.csv"
+    # 500 Hz => dt = 0.002 s
+    rows = [
+        ["timestamp", "II"],
+        ["0.000", "0.0"],
+        ["0.002", "0.1"],
+        ["0.004", "0.0"],
+        ["0.006", "-0.1"],
+    ]
+    with p.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerows(rows)
+
+    leads, fs = load_leads_from_csv(str(p))
+    assert "timestamp" not in leads
+    assert "II" in leads
+    assert fs == 500.0
+
+
+def test_loader_accepts_time_ms_and_converts_unit_to_fs_guess(tmp_path: Path) -> None:
+    from medgem_poc.qc import load_leads_from_csv
+
+    p = tmp_path / "mini_time_ms.csv"
+    # 500 Hz => dt = 2.0 ms
+    rows = [
+        ["time_ms", "II"],
+        ["0.0", "0.0"],
+        ["2.0", "0.1"],
+        ["4.0", "0.0"],
+        ["6.0", "-0.1"],
+    ]
+    with p.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerows(rows)
+
+    leads, fs = load_leads_from_csv(str(p))
+    assert "time_ms" not in leads
+    assert "II" in leads
+    assert fs == 500.0
+
+
 def test_A_09487_ok_must_be_pass() -> None:
     csv_ok = DEMO_DIR / "ecg_09487_12leads_2p5s_500Hz.csv"
     if not csv_ok.exists():

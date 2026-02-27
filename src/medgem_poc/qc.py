@@ -1894,7 +1894,7 @@ def load_leads_from_csv(path: str) -> tuple[dict[str, np.ndarray], float]:
     """
     Robust loader:
     - first row header expected
-    - optional 'time' column ignored
+    - optional time column ignored (explicit keys + safe wildcard fallback)
     - returns (leads_dict, fs_hz_guess)
     """
     with open(path, "r", encoding="utf-8") as f:
@@ -1916,11 +1916,39 @@ def load_leads_from_csv(path: str) -> tuple[dict[str, np.ndarray], float]:
     cols_l = {str(name).strip().lower(): i for name, i in cols.items()}
 
     time_idx = None
-    # Many demo CSVs use "time_s" (seconds). Treat it as time axis, not an ECG lead.
+    time_key = None
+
+    # Explicit time keys (standard + common variants)
     for k in ("t", "time", "time_s", "time_ms", "sec", "secs", "second", "seconds"):
         if k in cols_l:
             time_idx = cols_l[k]
+            time_key = k
             break
+
+    # Fallback (import CSV “user”): wildcard time* / timestamp* with monotone validation
+    if time_idx is None:
+
+        def _looks_like_time_axis(x: np.ndarray) -> bool:
+            if x.size < 3:
+                return False
+            d = np.diff(x.astype(np.float64, copy=False))
+            # quasi-monotone: reject ECG-like oscillations
+            pos_ratio = float(np.mean(d > 0))
+            if pos_ratio < 0.98:
+                return False
+            dpos = d[d > 0]
+            if dpos.size == 0:
+                return False
+            return float(np.median(dpos)) > 0.0
+
+        for name, i in cols.items():
+            n = str(name).strip().lower()
+            if not (n.startswith("time") or n.startswith("timestamp")):
+                continue
+            if _looks_like_time_axis(arr[:, i]):
+                time_idx = i
+                time_key = n
+                break
 
     leads: dict[str, np.ndarray] = {}
     for name, i in cols.items():
@@ -1932,13 +1960,31 @@ def load_leads_from_csv(path: str) -> tuple[dict[str, np.ndarray], float]:
 
     fs_guess = 500.0
     if time_idx is not None:
-        t = arr[:, time_idx]
+        t = arr[:, time_idx].astype(np.float64, copy=False)
         if t.size >= 3:
-            dt = float(np.median(np.diff(t)))
-            if dt > 0:
-                fs_guess = float(round(1.0 / dt))
+            d = np.diff(t)
+            d = d[d > 0]
+            if d.size:
+                dt = float(np.median(d))
+                if dt > 0:
+                    # If explicit key says ms, convert deterministically
+                    if time_key == "time_ms":
+                        dt_s = dt / 1000.0
+                        fs_guess = float(round(1.0 / dt_s))
+                    else:
+                        # Otherwise pick best unit scale using plausible ECG fs range
+                        common = (250.0, 300.0, 360.0, 400.0, 500.0, 1000.0)
+                        candidates: list[tuple[float, float]] = []
+                        for denom in (1.0, 1e-3, 1e-6):  # s, ms, us
+                            dt_s = dt * denom
+                            fs = 1.0 / dt_s
+                            if 20.0 <= fs <= 5000.0:
+                                score = min(abs(fs - c) for c in common)
+                                candidates.append((score, fs))
+                        if candidates:
+                            fs_guess = float(round(min(candidates, key=lambda x: x[0])[1]))
 
-    return leads, fs_guess
+    return leads, fs_guess  # Terminus
 
 
 def save_qc_report_json(path: str, report: dict[str, Any]) -> None:
