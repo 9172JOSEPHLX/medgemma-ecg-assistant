@@ -185,6 +185,7 @@ def _compute_status_strict_from_warnings(warnings: List[Dict[str, Any]]) -> str:
     return status
 
 
+WARN_LIMB_SWAP_SUSPECT = "WARN_LIMB_SWAP_SUSPECT"
 
 
 def _normalize_sex(patient_sex: Any) -> str:
@@ -2537,28 +2538,42 @@ def qc_signal_from_leads(
     )
 
     # --- Limb electrode reversal suspicion (Option B) ---
+    # Acquisition warning only: never set strict=FAIL here, never crash QC.
     try:
-        rev = detect_limb_reversal(leads)
-        metrics["limb_swap_kind"]  = rev["kind"]
-        metrics["limb_swap_score"] = rev["score_best"]
-        metrics["limb_swap_delta"] = rev["delta"]
+        # Prefer processed leads (post normalize/resample) if available
+        _leads_for_swap = locals().get("leads_proc") or leads
 
-        if rev["kind"] != "NONE":
-            # Conservative gating (avoid false positives)
-            if rev["score_best"] >= 0.60 and rev["delta"] >= 0.25:
-                status_strict = "FAIL"
-                reasons.append(f"Suspected limb electrode reversal ({rev['kind']}) high-confidence.")
-                warnings.append({
-                    "code": "FAIL_LIMB_LEAD_REVERSAL_SUSPECTED",
-                    "reason": f"Limb electrode reversal suspected: {rev['kind']} (score={rev['score_best']:.2f}, delta={rev['delta']:.2f}).",
-                    "severity": "high"
-                })
-            elif rev["score_best"] >= 0.45 and rev["delta"] >= 0.15:
-                warnings.append({
-                    "code": "WARN_LIMB_LEAD_REVERSAL_POSSIBLE",
-                    "reason": f"Possible limb lead reversal: {rev['kind']} (score={rev['score_best']:.2f}, delta={rev['delta']:.2f}).",
-                    "severity": "medium"
-                })
+        rev = detect_limb_reversal(_leads_for_swap)
+
+        metrics["limb_swap_kind"] = rev.get("kind", "NONE")
+        metrics["limb_swap_score"] = rev.get("score_best")
+        metrics["limb_swap_delta"] = rev.get("delta")
+
+        kind = rev.get("kind", "NONE")
+        score = float(rev.get("score_best") or 0.0)
+        delta = float(rev.get("delta") or 0.0)
+
+        # Conservative thresholds (avoid false positives): warn only (no FAIL)
+        if kind != "NONE" and (score >= 0.45 and delta >= 0.15):
+            warnings.append(
+                {
+                    "code": "WARN_LIMB_SWAP_SUSPECT",
+                    "reason": (
+                        f"Acquisition warning: suspected limb electrode reversal: {kind} "
+                        f"(score={score:.2f}, delta={delta:.2f}). Please repeat acquisition/check electrodes."
+                    ),
+                    "severity": "medium" if (score < 0.60 or delta < 0.25) else "high",
+                }
+            )
+
+            # Force overall status to WARN unless already FAIL for other reasons
+            if status != "FAIL":
+                status = "WARN"
+            if status_strict != "FAIL" and status_strict == "PASS":
+                status_strict = "WARN"
+
+            # Optional: add a human-readable reason (still not a FAIL reason)
+            reasons.append(f"Suspected limb electrode reversal ({kind}) — acquisition warning.")
     except Exception:
         # keep QC robust: never crash on limb reversal heuristic
         pass
@@ -2820,6 +2835,9 @@ def _map_to_dataset_status(qc_out: Dict[str, Any]) -> str:
         return "WARN"
     # FAIL_BASELINE_DRIFT is handled below with metric threshold, but if present and not extreme -> WARN
     strict_fail_drift = ("FAIL_BASELINE_DRIFT" in codes)
+
+    if "WARN_LIMB_SWAP_SUSPECT" in codes:
+        return "WARN"
 
     # ---- Metrics (fallback / main policy) ----
     try:
