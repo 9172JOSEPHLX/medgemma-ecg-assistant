@@ -1,5 +1,6 @@
 ﻿### --- file: src/medgem_poc/edge_metrics.py --- ### FEB 27th, 2026 11H37 VERSION 1.000
 ### --- file: src/medgem_poc/edge_metrics.py --- ### MARS 4th, 2026 16H27 VERSION 1.001 PATCH2 DEF EFF PATCH MINIMAL
+### --- file: src/medgem_poc/edge_metrics.py --- ### MARS 10th, 2026 16H50 VERSION 1.002 PATCH A QC ONLY
 
 from __future__ import annotations
 
@@ -245,7 +246,10 @@ class EdgeMetricsCollector:
     ) -> Iterator["EdgeMetricsCollector"]:
         self._degradation_mode = degradation_mode or "NONE"
         self._run_start_ns = time.perf_counter_ns()
-        _maybe_reset_cuda_peaks()
+
+        # ✅ Optionnel (propre): reset peaks CUDA uniquement si on utilise CUDA
+        if str(self.device).startswith("cuda"):
+            _maybe_reset_cuda_peaks()
 
         try:
             yield self
@@ -290,7 +294,19 @@ class EdgeMetricsCollector:
         }
 
         mem: Dict[str, Optional[float]] = {"ram_rss_mb": _get_ram_rss_mb()}
-        mem.update(_cuda_mem_snapshot_mb())
+
+        # VRAM meaningful only if this run actually used a CUDA device
+        if str(self.device).startswith("cuda"):
+            mem.update(_cuda_mem_snapshot_mb())
+        else:
+            mem.update(
+                {
+                    "vram_allocated_mb": None,
+                    "vram_reserved_mb": None,
+                    "vram_peak_allocated_mb": None,
+                }
+            )
+
         self.report.memory = mem
 
         deg = self._degradation_mode or "NONE"
@@ -407,4 +423,4 @@ def collect_with_stages(
 
 
 # TERMINUS
-# --- file: tests/test_edge_metrics.py ---
+# --- file: edge_metrics.py ---

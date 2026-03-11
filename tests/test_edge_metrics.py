@@ -1,4 +1,4 @@
-﻿# SCRIPT tests/test_edge_metrics.py Mars 4th, 2026.
+﻿# SCRIPT tests/test_edge_metrics.py Mars 4th, 2026. 
 
 from __future__ import annotations
 
@@ -172,4 +172,51 @@ def test_pretty_includes_effective_mode_and_readiness_is_consistent(
     d = c.report.to_dict()
     assert d["resilience"]["edge_readiness_status"] == expected
 
-# TERMINUS DU SCRIPT 
+def test_vram_is_none_when_device_is_cpu_even_if_cuda_available(monkeypatch):
+    monkeypatch.setenv("FORCE_CPU", "1")
+
+    from medgem_poc import edge_metrics as emod
+    from medgem_poc.edge_metrics import EdgeMetricsCollector
+
+    class _FakeCuda:
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def memory_allocated():
+            return 123 * 1024 * 1024
+
+        @staticmethod
+        def memory_reserved():
+            return 456 * 1024 * 1024
+
+        @staticmethod
+        def max_memory_allocated():
+            return 789 * 1024 * 1024
+
+        @staticmethod
+        def reset_peak_memory_stats():
+            return None
+
+    class _FakeTorch:
+        __version__ = "fake"
+        cuda = _FakeCuda()
+        class version:
+            cuda = "fake-cuda"
+
+    monkeypatch.setattr(emod, "_TORCH", _FakeTorch, raising=True)
+
+    c = EdgeMetricsCollector(backend="unit", offline_mode=True)
+    with c.run(degradation_mode="NONE"):
+        with c.stage("infer"):
+            _ = sum(range(1000))
+
+    d = c.report.to_dict()
+    assert d["runtime"]["device"] == "cpu"
+    mem = d["memory"]
+    assert mem["vram_allocated_mb"] is None
+    assert mem["vram_reserved_mb"] is None
+    assert mem["vram_peak_allocated_mb"] is None
+
+# TERMINUS DU SCRIPT tests/test_edge_metrics.py
