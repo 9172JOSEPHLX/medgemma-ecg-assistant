@@ -2539,41 +2539,80 @@ def qc_signal_from_leads(
 
     # --- Limb electrode reversal suspicion (Option B) ---
     # Acquisition warning only: never set strict=FAIL here, never crash QC.
+    # ---- Limb electrode reversal suspicion (Option B) ----
+    # Acquisition warning only: never FAIL on this heuristic
     try:
-        # Prefer processed leads (post normalize/resample) if available
-        _leads_for_swap = locals().get("leads_proc") or leads
+        leads_eval = leads_proc if "leads_proc" in locals() and isinstance(leads_proc, dict) else leads
 
-        rev = detect_limb_reversal(_leads_for_swap)
+        rev = detect_limb_reversal(leads_eval)
+        kind = str(rev.get("kind", "NONE"))
+        score_best = float(rev.get("score_best", 0.0) or 0.0)
+        delta = float(rev.get("delta", 0.0) or 0.0)
 
-        metrics["limb_swap_kind"] = rev.get("kind", "NONE")
-        metrics["limb_swap_score"] = rev.get("score_best")
-        metrics["limb_swap_delta"] = rev.get("delta")
+        metrics["limb_swap_kind"] = kind
+        metrics["limb_swap_score"] = score_best
+        metrics["limb_swap_delta"] = delta
 
-        kind = rev.get("kind", "NONE")
-        score = float(rev.get("score_best") or 0.0)
-        delta = float(rev.get("delta") or 0.0)
+        suspect = False
+        suspect_kind = None
+        suspect_reason = None
 
-        # Conservative thresholds (avoid false positives): warn only (no FAIL)
-        if kind != "NONE" and (score >= 0.45 and delta >= 0.15):
+        # Primary path: detector explicitly returns a swap kind
+        if kind != "NONE":
+            # If you still want light gating, keep it low; but do NOT FAIL
+            if score_best >= 0.35:
+                suspect = True
+                suspect_kind = kind
+                suspect_reason = f"detect_limb_reversal kind={kind} (score={score_best:.2f}, delta={delta:.2f})"
+        else:
+            # Fallback path: detector is muet (delta=0.0), so add a minimal signal-driven check.
+            # Goal: trigger on *simulated* RA<->LA swaps without false positives on baseline OK.
+            # import numpy as np
+
+            def _safe_corr(a: np.ndarray, b: np.ndarray) -> float:
+                a = np.asarray(a, dtype=np.float64)
+                b = np.asarray(b, dtype=np.float64)
+                n = min(a.size, b.size)
+                if n < 200:
+                    return 0.0
+                a = a[:n]
+                b = b[:n]
+                sa = float(np.std(a))
+                sb = float(np.std(b))
+                if sa < 1e-9 or sb < 1e-9:
+                    return 0.0
+                c = float(np.corrcoef(a, b)[0, 1])
+                return c if np.isfinite(c) else 0.0
+
+            # Heuristic: RA<->LA swap tends to flip Lead I polarity; correlations with II/III often become negative.
+            if all(k in leads_eval for k in ("I", "II", "III", "aVR", "aVL", "aVF")):
+                c_i_ii = _safe_corr(leads_eval["I"], leads_eval["II"])
+                c_i_iii = _safe_corr(leads_eval["I"], leads_eval["III"])
+                metrics["limb_swap_corr_i_ii"] = c_i_ii
+                metrics["limb_swap_corr_i_iii"] = c_i_iii
+
+                # Conservative threshold: should stay OK on 09487_ok but fire on your simulated RA/LA swap.
+                if min(c_i_ii, c_i_iii) < -0.35:
+                    suspect = True
+                    suspect_kind = "RA_LA"
+                    suspect_reason = f"fallback corr(I,II)={c_i_ii:.2f}, corr(I,III)={c_i_iii:.2f}"
+
+        if suspect:
             warnings.append(
                 {
                     "code": "WARN_LIMB_SWAP_SUSPECT",
-                    "reason": (
-                        f"Acquisition warning: suspected limb electrode reversal: {kind} "
-                        f"(score={score:.2f}, delta={delta:.2f}). Please repeat acquisition/check electrodes."
-                    ),
-                    "severity": "medium" if (score < 0.60 or delta < 0.25) else "high",
+                    "reason": f"Possible limb electrode swap ({suspect_kind}). {suspect_reason}",
+                    "severity": "WARN",
                 }
             )
+            reasons.append("WARN_LIMB_SWAP_SUSPECT")
 
-            # Force overall status to WARN unless already FAIL for other reasons
-            if status != "FAIL":
+            # Force WARN (never downgrade FAIL)
+            if status == "PASS":
                 status = "WARN"
-            if status_strict != "FAIL" and status_strict == "PASS":
+            if status_strict == "PASS":
                 status_strict = "WARN"
 
-            # Optional: add a human-readable reason (still not a FAIL reason)
-            reasons.append(f"Suspected limb electrode reversal ({kind}) — acquisition warning.")
     except Exception:
         # keep QC robust: never crash on limb reversal heuristic
         pass
