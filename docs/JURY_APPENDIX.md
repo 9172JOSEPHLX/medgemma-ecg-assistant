@@ -136,3 +136,5 @@ QC warnings are used for acquisition quality and resilience handling; it does **
 
 - GitHub Release (immutable code reference for this appendix):  
   https://github.com/9172JOSEPHLX/medgemma-ecg-assistant/releases/tag/v0.1.1-kaggle-jury-20260312
+
+- Demo video (YouTube): https://youtu.be/Cu7NKj1g9lA
