@@ -2537,95 +2537,229 @@ def qc_signal_from_leads(
         }
     )
 
-    # ---- Limb electrode reversal suspicion (Option B) ---- Ligne 2540 Updated Mars 12th, 2026, 08H00 AM.
+    # ---- Limb electrode reversal suspicion (Option B) ---- Ligne 2540 Updated Mars 12th, 2026, 16H59 AM.
     # Acquisition warning only: never FAIL on this heuristic
+    
     try:
         leads_eval = leads_proc if "leads_proc" in locals() and isinstance(leads_proc, dict) else leads
 
-        rev = detect_limb_reversal(leads_eval)
-        kind = str(rev.get("kind", "NONE")).upper()
-        score_best = float(rev.get("score_best", 0.0) or 0.0)
-        score_none = float(rev.get("score_none", 0.0) or 0.0)
-        delta = float(rev.get("delta", 0.0) or 0.0)
-
-        metrics["limb_swap_kind"] = kind
-        metrics["limb_swap_score_best"] = score_best
-        metrics["limb_swap_score_none"] = score_none
-        metrics["limb_swap_delta"] = delta
+        # ---- defaults (keys always present) ----
+        metrics["limb_swap_kind"] = "NONE"
+        metrics["limb_swap_score_best"] = 0.0
+        metrics["limb_swap_score_none"] = 0.0
+        metrics["limb_swap_delta"] = 0.0
+        metrics["limb_swap_score"] = 0.0  # backward-friendly alias
 
         suspect = False
         suspect_kind = None
         suspect_reason = None
 
-        # Treat detector output as "confident" only if kind!=NONE AND score/delta pass thresholds
-        primary_confident = (kind != "NONE") and (score_best >= 0.35) and (delta >= 0.15)
-        metrics["limb_swap_primary_confident"] = bool(primary_confident)
+        # ---- helpers ----
+        def _safe_corr(a: np.ndarray, b: np.ndarray) -> float:
+            a = np.asarray(a, dtype=np.float64)
+            b = np.asarray(b, dtype=np.float64)
+            n = min(a.size, b.size)
+            if n < 200:
+                return 0.0
+            a = a[:n]
+            b = b[:n]
+            sa = float(np.std(a))
+            sb = float(np.std(b))
+            if sa < 1e-9 or sb < 1e-9:
+                return 0.0
+            c = float(np.corrcoef(a, b)[0, 1])
+            return c if np.isfinite(c) else 0.0
 
-        if primary_confident:
-            suspect = True
-            suspect_kind = kind
-            suspect_reason = f"detect_limb_reversal confident kind={kind} (score={score_best:.2f}, delta={delta:.2f})"
-        else:
-            # Fallback path:
-            # - runs when detector is muet (kind==NONE) OR when it returns a weak/misleading kind
-            # - goal: trigger on simulated swaps while avoiding false positives on OK baseline
+        def _p95_p5(x: np.ndarray) -> tuple[float, float]:
+            x = np.asarray(x, dtype=np.float64)
+            if x.size < 200:
+                return 0.0, 0.0
+            p5 = float(np.percentile(x, 5))
+            p95 = float(np.percentile(x, 95))
+            return p95, p5
 
-            def _safe_corr(a: np.ndarray, b: np.ndarray) -> float:
-                a = np.asarray(a, dtype=np.float64)
-                b = np.asarray(b, dtype=np.float64)
-                n = min(a.size, b.size)
-                if n < 200:
-                    return 0.0
-                a = a[:n]
-                b = b[:n]
-                sa = float(np.std(a))
-                sb = float(np.std(b))
-                if sa < 1e-9 or sb < 1e-9:
-                    return 0.0
-                c = float(np.corrcoef(a, b)[0, 1])
-                return c if np.isfinite(c) else 0.0
+        def _pol_ratio(x: np.ndarray) -> float:
+            p95, p5 = _p95_p5(x)
+            return float(abs(p5) / (abs(p95) + 1e-9))
 
-            def _p95_p5(x: np.ndarray) -> tuple[float, float]:
-                x = np.asarray(x, dtype=np.float64)
-                if x.size < 200:
-                    return 0.0, 0.0
-                p95 = float(np.nanpercentile(x, 95))
-                p5 = float(np.nanpercentile(x, 5))
-                if not np.isfinite(p95):
-                    p95 = 0.0
-                if not np.isfinite(p5):
-                    p5 = 0.0
-                return p95, p5
+        # ---- compute detector (best-effort) ----
+        rev = detect_limb_reversal(leads_eval)
 
-            # (A) RA<->LA-like: Lead I polarity / consistency tends to flip → corr(I,II) & corr(I,III) negative
-            if all(k in leads_eval for k in ("I", "II", "III")):
-                c_i_ii = _safe_corr(leads_eval["I"], leads_eval["II"])
-                c_i_iii = _safe_corr(leads_eval["I"], leads_eval["III"])
-                metrics["limb_swap_corr_i_ii"] = c_i_ii
-                metrics["limb_swap_corr_i_iii"] = c_i_iii
+        kind_raw = str(rev.get("kind", "NONE")).upper().strip()
+        score_best = float(rev.get("score_best", 0.0) or 0.0)
+        score_none = float(rev.get("score_none", 0.0) or 0.0)
+        delta = float(rev.get("delta", 0.0) or 0.0)
 
-                # Conservative threshold: should stay OK on baseline but fire on simulated RA/LA swap
-                if min(c_i_ii, c_i_iii) < -0.35:
-                    suspect = True
-                    suspect_kind = "RA_LA"
-                    suspect_reason = f"fallback corr(I,II)={c_i_ii:.2f}, corr(I,III)={c_i_iii:.2f}"
+        # RAW = sortie brute du détecteur (peut contenir des FP faibles)
+        metrics["limb_swap_kind_raw"] = kind_raw
 
-            # (B) RA<->LL-like: Lead II inversion is common in the RA<->LL mapping (II' = -II)
-            # Only run if not already flagged by (A)
-            if (not suspect) and ("II" in leads_eval):
-                p95, p5 = _p95_p5(leads_eval["II"])
-                metrics["limb_swap_leadII_p95"] = p95
-                metrics["limb_swap_leadII_p5"] = p5
-                ratio = abs(p5) / (abs(p95) + 1e-9)
-                metrics["limb_swap_leadII_negpos_ratio"] = float(ratio)
+        # FINAL (jury-safe) = uniquement si on décide "suspect=True" et qu’on émet WARN_LIMB_SWAP_SUSPECT
+        metrics["limb_swap_kind"] = "NONE"
+        metrics["limb_swap_suspect"] = False
 
-                # Heuristic: inverted II often makes negative extreme dominate (ratio > 1)
-                # Keep conservative to avoid false positives on OK baseline.
-                if (p5 < 0.0) and (ratio >= 1.20):
-                    suspect = True
-                    suspect_kind = "RA_LL"
-                    suspect_reason = f"fallback LeadII inversion (p95={p95:.3f}, p5={p5:.3f}, ratio={ratio:.2f})"
+        metrics["limb_swap_score_best"] = score_best
+        metrics["limb_swap_score_none"] = score_none
+        metrics["limb_swap_delta"] = delta
+        metrics["limb_swap_score"] = score_best  # alias backward-friendly
 
+        # ---- features (signal-only) ----
+        c_i_ii = None
+        c_i_iii = None
+        if all(k in leads_eval for k in ("I", "II")):
+            c_i_ii = _safe_corr(leads_eval["I"], leads_eval["II"])
+            metrics["limb_swap_corr_i_ii"] = c_i_ii
+        if all(k in leads_eval for k in ("I", "III")):
+            c_i_iii = _safe_corr(leads_eval["I"], leads_eval["III"])
+            metrics["limb_swap_corr_i_iii"] = c_i_iii
+
+        r_i = None
+        r_ii = None
+        r_iii = None
+        if "I" in leads_eval:
+            r_i = _pol_ratio(leads_eval["I"])
+            metrics["limb_swap_polarity_ratio_i"] = r_i
+        if "II" in leads_eval:
+            r_ii = _pol_ratio(leads_eval["II"])
+            metrics["limb_swap_polarity_ratio_ii"] = r_ii
+        if "III" in leads_eval:
+            r_iii = _pol_ratio(leads_eval["III"])
+            metrics["limb_swap_polarity_ratio_iii"] = r_iii
+
+        # ---- evidence functions (conservative to avoid baseline FP) ----
+        # Strong polarity evidence alone (rare on OK)
+        STRONG_RATIO = 1.35
+        # Normal polarity evidence requires mild correlation support (reduces FP on 09487_ok / 11899)
+        RATIO = 1.25
+        CORR_SUPPORT = -0.15
+
+        def _ev_ra_la() -> tuple[bool, str]:
+            if r_i is None:
+                return False, "RA_LA: missing I"
+            if r_i >= STRONG_RATIO:
+                return True, f"RA_LA: strong ratioI={r_i:.2f}"
+            ok_corr = False
+            if c_i_ii is not None and c_i_ii < CORR_SUPPORT:
+                ok_corr = True
+            if c_i_iii is not None and c_i_iii < CORR_SUPPORT:
+                ok_corr = True
+            if r_i >= RATIO and ok_corr:
+                return True, f"RA_LA: ratioI={r_i:.2f} + corr support (I,II)={c_i_ii} (I,III)={c_i_iii}"
+            return False, f"RA_LA: ratioI={r_i:.2f} corr(I,II)={c_i_ii} corr(I,III)={c_i_iii}"
+
+        def _ev_ra_ll() -> tuple[bool, str]:
+            if r_ii is None:
+                return False, "RA_LL: missing II"
+            if r_ii >= STRONG_RATIO:
+                return True, f"RA_LL: strong ratioII={r_ii:.2f}"
+            # for RA_LL, use corr(I,II) as support when available
+            if r_ii >= RATIO and (c_i_ii is not None and c_i_ii < CORR_SUPPORT):
+                return True, f"RA_LL: ratioII={r_ii:.2f} + corr(I,II)={c_i_ii:.2f}"
+            return False, f"RA_LL: ratioII={r_ii:.2f} corr(I,II)={c_i_ii}"
+
+        def _ev_la_ll() -> tuple[bool, str]:
+            # legacy path (III-based) kept intact
+            if r_iii is None:
+                return False, "LA_LL: missing III"
+            if r_iii >= STRONG_RATIO:
+                return True, f"LA_LL: strong ratioIII={r_iii:.2f}"
+            if r_iii >= RATIO and (c_i_iii is not None and c_i_iii < CORR_SUPPORT):
+                return True, f"LA_LL: ratioIII={r_iii:.2f} + corr(I,III)={c_i_iii:.2f}"
+            return False, f"LA_LL: ratioIII={r_iii:.2f} corr(I,III)={c_i_iii}"
+
+        # ✅ NEW: LA<->LL fallback (signal-only) — “swap pattern I vs II”
+        # LA<->LL mapping tends to swap I and II. We look for inversion of polarity pattern:
+        #   OK baseline (example): ratioI low, ratioII higher
+        #   LA_LL swap:            ratioI higher, ratioII lower
+        def _ev_la_ll_swap() -> tuple[bool, str, float]:
+            if r_i is None or r_ii is None:
+                return False, "LA_LL(swap): missing I/II", 0.0
+
+            # debugging metric (optional)
+            metrics["limb_swap_ratio_i_over_ii"] = float(r_i / (r_ii + 1e-9))
+
+            # conservative rule: should not fire on baseline OK, but should fire on LA_LL swap
+            ok = (r_i >= 0.60 and r_ii <= 0.45 and (r_i / (r_ii + 1e-9)) >= 1.5)
+            why = f"LA_LL(swap): ratioI={r_i:.2f}, ratioII={r_ii:.2f}, i/ii={metrics['limb_swap_ratio_i_over_ii']:.2f}"
+            # score used for candidate ranking (prefer stronger ratioI)
+            return ok, why, float(r_i)
+
+        def _confirm_by_kind(k: str) -> tuple[bool, str]:
+            k = (k or "NONE").upper().strip()
+            if k == "RA_LA":
+                return _ev_ra_la()
+            if k == "RA_LL":
+                return _ev_ra_ll()
+            if k == "LA_LL":
+                # for LA_LL, accept either legacy (III-based) or swap-pattern evidence
+                ok_swap, why_swap, _ = _ev_la_ll_swap()
+                if ok_swap:
+                    return True, why_swap
+                return _ev_la_ll()
+
+            # unknown kind => require strong evidence from any ratio
+            ok1, why1 = _ev_ra_la()
+            ok2, why2 = _ev_ra_ll()
+            ok3, why3 = _ev_la_ll()
+            ok4, why4, _ = _ev_la_ll_swap()
+            if ok1:
+                return True, why1
+            if ok2:
+                return True, why2
+            if ok4:
+                return True, why4
+            if ok3:
+                return True, why3
+            return False, f"unknown kind={k}: no evidence ({why1}) ({why2}) ({why3}) ({why4})"
+
+        # ---- decision logic ----
+        kind_det = kind_raw  # robust (no variable 'kind' dependency)
+
+        # 1) If detector claims a kind, treat it as *proposal* only.
+        #    We require BOTH confidence (score/delta) AND signal-only confirmation.
+        conf_det = (score_best >= 0.60 and delta >= 0.25) or (score_best >= 0.55 and delta >= 0.30)
+        if kind_det != "NONE" and conf_det:
+            ok2, why2 = _confirm_by_kind(kind_det)
+            if ok2:
+                suspect = True
+                suspect_kind = kind_det
+                suspect_reason = (
+                    f"detect_limb_reversal confirmed kind={kind_det} "
+                    f"(score={score_best:.2f}, delta={delta:.2f}) | {why2}"
+                )
+                # ✅ “FINAL / jury-safe”
+                metrics["limb_swap_kind"] = str(suspect_kind or kind_det).upper().strip()
+                metrics["limb_swap_suspect"] = True
+
+        # 2) If not suspect yet (detector muet / non confident), use conservative signal-only fallbacks.
+        if not suspect:
+            ok_la, why_la = _ev_ra_la()
+            ok_rl, why_rl = _ev_ra_ll()
+            ok_ll, why_ll = _ev_la_ll()
+
+            # ✅ NEW: LA_LL swap-pattern evidence (I vs II)
+            ok_ll2, why_ll2, score_ll2 = _ev_la_ll_swap()
+
+            # choose the best supported kind (prefer strong evidence)
+            candidates = []
+            if ok_la:
+                candidates.append(("RA_LA", why_la, float(r_i or 0.0)))
+            if ok_rl:
+                candidates.append(("RA_LL", why_rl, float(r_ii or 0.0)))
+            if ok_ll:
+                candidates.append(("LA_LL", why_ll, float(r_iii or 0.0)))
+            if ok_ll2:
+                # prioritize LA_LL swap-pattern using ratioI as score
+                candidates.append(("LA_LL", why_ll2, float(score_ll2 or 0.0)))
+
+            if candidates:
+                candidates.sort(key=lambda x: float(x[2]), reverse=True)
+                suspect_kind, suspect_reason, _ = candidates[0]
+                suspect = True
+                # ✅ “FINAL / jury-safe”
+                metrics["limb_swap_kind"] = str(suspect_kind or kind_det).upper().strip()
+                metrics["limb_swap_suspect"] = True
+
+        # ---- emit acquisition warning ----
         if suspect:
             warnings.append(
                 {
@@ -2646,6 +2780,8 @@ def qc_signal_from_leads(
         # keep QC robust: never crash on limb reversal heuristic
         pass
 
+    # ---- Terminus Option B ----
+  
     # ----------------------------------------------------------------------
     # IEC HARDENED: Global dedup warnings by "code" (keeps first occurrence)
     # ----------------------------------------------------------------------
