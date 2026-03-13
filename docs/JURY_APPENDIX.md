@@ -3,7 +3,10 @@
 This appendix exists because Kaggle WriteUps can be locked after the submission deadline.  
 It provides an immutable, auditable fingerprint of the code executed on Kaggle and a fast checklist to validate the proof artifacts.
 
----
+** Kaggle Notebook **  
+   Public proof run notebook: https://www.kaggle.com/code/josluizlunaxavier/notebook8c2face391  
+   Immutable code reference: GitHub Release `v0.1.1-kaggle-jury-20260312` (see SHA256 fingerprints below).
+
 
 ## 1) Immutable build fingerprint (Kaggle "working" import)
 
@@ -123,5 +126,8 @@ QC warnings are used for acquisition quality and resilience handling; it does **
 - Kaggle WriteUp (official submission):  
   https://www.kaggle.com/competitions/med-gemma-impact-challenge/writeups/ecg-assistant-offline-qc-medgemma-structured
 
-- GitHub Release (this build fingerprint):  
-  See the repository Releases page for the tag corresponding to this appendix.
+- Kaggle Notebook (public proof run):  
+  https://www.kaggle.com/code/josluizlunaxavier/notebook8c2face391
+
+- GitHub Release (immutable code reference for this appendix):  
+  https://github.com/9172JOSEPHLX/medgemma-ecg-assistant/releases/tag/v0.1.1-kaggle-jury-20260312
