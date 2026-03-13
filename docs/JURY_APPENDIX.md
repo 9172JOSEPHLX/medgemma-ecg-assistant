@@ -26,6 +26,11 @@ The notebook **copies the package from the dataset vNext folder into `/kaggle/wo
   SHA256: `0374680db9d0e6d082f94a2b1e47ca91c33a2381506362759b277b0cf6c3f234`  
   Signals: `EdgeMetricsCollector` present; `degradation_mode_effective` supported
 
+### Tagged source files (immutable)
+- qc.py (tag `v0.1.1-kaggle-jury-20260312`):  
+  https://github.com/9172JOSEPHLX/medgemma-ecg-assistant/blob/v0.1.1-kaggle-jury-20260312/src/medgem_poc/qc.py
+- edge_metrics.py (tag `v0.1.1-kaggle-jury-20260312`):  
+  https://github.com/9172JOSEPHLX/medgemma-ecg-assistant/blob/v0.1.1-kaggle-jury-20260312/src/medgem_poc/edge_metrics.py
 ---
 
 ## 2) Dataset snapshot used to build the working copy (vNext)
