@@ -1,14 +1,25 @@
 # Jury Appendix — Build Fingerprint & Proofs (MedGemma ECG Assistant)
 
 This appendix exists because Kaggle WriteUps can be locked after the submission deadline.  
-It provides an immutable, auditable fingerprint of the code executed on Kaggle and a fast checklist to validate the proof artifacts.
+It provides an **immutable, auditable fingerprint** of the code executed on Kaggle and a fast checklist to validate the proof artifacts.
 
-** Kaggle Notebook **  
-   Public proof run notebook: https://www.kaggle.com/code/josluizlunaxavier/notebook8c2face391  
-   Immutable code reference: GitHub Release `v0.1.1-kaggle-jury-20260312` (see SHA256 fingerprints below).
+## 0) Source-of-truth policy (important)
 
+- **Immutable code reference for judges:** Git tag **`v0.1.1-kaggle-jury-20260312`** (do not use `main` HEAD for proof).
+- **Post-jury work:** must happen on a separate development branch (e.g. `dev/post-jury`) and **must not modify the tag**.
 
-## 1) Immutable build fingerprint (Kaggle "working" import)
+## Kaggle notebook & write-up
+
+- Public proof run notebook: https://www.kaggle.com/code/josluizlunaxavier/notebook8c2face391  
+- Kaggle WriteUp (official submission):  
+  https://www.kaggle.com/competitions/med-gemma-impact-challenge/writeups/ecg-assistant-offline-qc-medgemma-structured  
+- GitHub Release (immutable code reference for this appendix):  
+  https://github.com/9172JOSEPHLX/medgemma-ecg-assistant/releases/tag/v0.1.1-kaggle-jury-20260312  
+- Demo video (YouTube): https://youtu.be/Cu7NKj1g9lA
+
+---
+
+## 1) Immutable build fingerprint (Kaggle “working” import)
 
 The notebook **copies the package from the dataset vNext folder into `/kaggle/working/`** and forces imports from there (to avoid legacy/flat imports from `/kaggle/input`).
 
@@ -19,21 +30,26 @@ The notebook **copies the package from the dataset vNext folder into `/kaggle/wo
 - `medgem_poc.qc`  
   File: `/kaggle/working/appli_medgem_poc_code/src/medgem_poc/qc.py`  
   SHA256: `c4fd64429491a3846de2451b1bf7b60640f1bcfb45f8d4bec7e9c9d37c87da38`  
-  Signals: `detect_limb_reversal` present; `WARN_LIMB_SWAP_SUSPECT` enabled
+  Signals: `detect_limb_reversal` present; `WARN_LIMB_SWAP_SUSPECT` enabled; **baseline preserved**
 
 - `medgem_poc.edge_metrics`  
   File: `/kaggle/working/appli_medgem_poc_code/src/medgem_poc/edge_metrics.py`  
   SHA256: `0374680db9d0e6d082f94a2b1e47ca91c33a2381506362759b277b0cf6c3f234`  
-  Signals: `EdgeMetricsCollector` present; `degradation_mode_effective` supported
+  Signals: `EdgeMetricsCollector` present; `degradation_mode_effective` supported; **CPU VRAM fields are `null`**
 
 ### Tagged source files (immutable)
+
+These links must be used for audit (the tag is frozen):
+
 - qc.py (tag `v0.1.1-kaggle-jury-20260312`):  
   https://github.com/9172JOSEPHLX/medgemma-ecg-assistant/blob/v0.1.1-kaggle-jury-20260312/src/medgem_poc/qc.py
+
 - edge_metrics.py (tag `v0.1.1-kaggle-jury-20260312`):  
   https://github.com/9172JOSEPHLX/medgemma-ecg-assistant/blob/v0.1.1-kaggle-jury-20260312/src/medgem_poc/edge_metrics.py
+
 ---
 
-## 2) Dataset snapshot used to build the working copy (vNext)
+## 2) Dataset snapshot used to build the working copy (code3 vNext)
 
 Dataset folder (vNext):
 - `/kaggle/input/datasets/josluizlunaxavier/jllxavierappli-medgem-poc-code3/kaggle_code3_vNext`
@@ -79,24 +95,24 @@ After running the notebook end-to-end, the pipeline writes verifiable Edge Metri
 Open any JSON proof artifact and check:
 
 1) **Device**
-   - `backend/device` is `cuda:*` (GPU) or `cpu` (failure injection)
+   - runtime device is `cuda:*` (GPU) or `cpu` (failure injection)
 
 2) **Latency**
-   - `LATENCY.total_ms` (and `pre_ms`, `infer_ms`, `post_ms`)
+   - `latency_ms.total` (and `pre`, `infer`, `post`)
 
 3) **Memory**
-   - `MEMORY.ram_rss_mb`
+   - `memory.ram_rss_mb`
    - VRAM fields are present only when GPU is used
-   - When `device=cpu`, VRAM fields must be `null` / "n/a"
+   - When `device=cpu`, VRAM fields must be `null` / pretty prints as `n/a`
 
 4) **Resilience**
-   - `RESILIENCE.offline_mode`
-   - `RESILIENCE.fallback_used`
-   - `RESILIENCE.fallback_reason`
-   - `RESILIENCE.degradation_mode_effective`
+   - `resilience.offline_mode`
+   - `resilience.fallback_used`
+   - `resilience.fallback_reason`
+   - `resilience.degradation_mode_effective`
 
 5) **QC acquisition warnings**
-   - Swap case must include `WARN_LIMB_SWAP_SUSPECT` (acquisition warning only)
+   - Swap case must include `WARN_LIMB_SWAP_SUSPECT` (**acquisition warning only**)
 
 ---
 
@@ -104,16 +120,16 @@ Open any JSON proof artifact and check:
 
 - **QC gate semantics:** `PASS / WARN / FAIL`  
   - `WARN` indicates acquisition quality concerns or resilience degradations.
-  - `FAIL` is reserved for missing/invalid signal or severe issues (not used solely for SWAP).
+  - `FAIL` is reserved for missing/invalid signal or severe issues (**not used solely for SWAP**).
 
-- **SWAP:**  
+- **SWAP policy:**  
   - Limb-electrode inversion is surfaced as **`WARN_LIMB_SWAP_SUSPECT`**.
   - This is an **acquisition** warning ("recheck electrode placement / reacquire ECG"), **not a clinical diagnosis**.
 
-- **Failure injection:**  
+- **Failure injection policy:**  
   - Setting `FORCE_CPU=1` forces a degraded mode:
     - `device=cpu`
-    - VRAM reported as n/a
+    - VRAM reported as `null` / pretty `n/a`
     - fallback fields set
     - `degradation_mode_effective = QC_ONLY`
 
