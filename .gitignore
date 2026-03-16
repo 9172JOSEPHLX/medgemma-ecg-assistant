@@ -33,3 +33,8 @@ requirements-py310-or-legacy-freeze.txt
 
 Logs/
 
+
+# Kaggle packs
+kaggle_code3_vNext/
+kaggle_code3_vNext.zip
+
