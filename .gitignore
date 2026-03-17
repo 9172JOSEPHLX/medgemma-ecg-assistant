@@ -33,3 +33,17 @@ requirements-py310-or-legacy-freeze.txt
 
 Logs/
 
+
+# Backups
+*.bak_*
+
+
+# Local Kaggle exports
+kaggle_code3_export/
+kaggle_code3_export.zip
+
+
+# Kaggle packs
+kaggle_code3_vNext/
+kaggle_code3_vNext.zip
+
