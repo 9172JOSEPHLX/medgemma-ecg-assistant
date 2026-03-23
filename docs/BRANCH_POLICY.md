@@ -1,5 +1,3 @@
-## 2) `docs/BRANCH_POLICY.md`
-```md
 # Branch Policy
 
 ## Purpose
