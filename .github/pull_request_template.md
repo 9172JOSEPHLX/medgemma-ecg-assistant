@@ -1,5 +1,3 @@
-# file: .github/pull_request_template.md
-
 ## Summary
 Describe the change in 2-4 lines.
 

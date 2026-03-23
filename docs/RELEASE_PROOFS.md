@@ -1,5 +1,3 @@
-# file: docs/RELEASE_PROOFS.md
-
 # Release Proofs
 
 This repository uses the immutable tag below as the jury/source-of-truth code reference:

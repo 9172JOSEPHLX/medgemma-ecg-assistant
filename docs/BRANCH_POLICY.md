@@ -1,6 +1,3 @@
-file: docs/BRANCH_POLICY.md
-
-
 ## 2) `docs/BRANCH_POLICY.md`
 ```md
 # Branch Policy
