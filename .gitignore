@@ -33,3 +33,7 @@ requirements-py310-or-legacy-freeze.txt
 
 Logs/
 
+# Release proof bundles (generated locally)
+release_assets/
+
+desktop.ini
