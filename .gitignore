@@ -1,39 +1,125 @@
-# venv
-.venv/
-.venv-ecg-torch310/
+# =========================================================
+# medgemma-ecg-assistant — .gitignore (V2)
+# Goal:
+# - keep main clean and reviewable
+# - ignore local environments, caches, logs, generated bundles
+# - ignore local Kaggle exports and release artifacts
+# - preserve the ability to track small demo/fixture data when needed
+# =========================================================
 
-# python cache
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-
-# outputs / artifacts
-outputs/
-*.log
-*.tmp
-
-# OS
+# ---------------------------------------------------------
+# OS / editor noise
+# ---------------------------------------------------------
 .DS_Store
 Thumbs.db
+desktop.ini
 
-# notebooks checkpoints
-.ipynb_checkpoints/
-
-# Python virtual envs (local)
-.venv-kaggle-py312/
+# ---------------------------------------------------------
+# Python environments / caches
+# ---------------------------------------------------------
+.venv/
 .venv*/
 **/.venv*/
+venv/
+venv*/
+__pycache__/
+*.py[cod]
+*$py.class
 
-# Build artifacts / generated outputs
-data/
+# Test / type / lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
 
-# Legacy local freezes
-requirements-py310-or-legacy-freeze.txt
+# Notebook checkpoints
+.ipynb_checkpoints/
 
+# ---------------------------------------------------------
+# Build / packaging artifacts
+# ---------------------------------------------------------
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# ---------------------------------------------------------
+# Logs / temp / local runtime noise
+# ---------------------------------------------------------
+*.log
+*.tmp
+*.temp
+tmp/
+temp/
 Logs/
+logs/
 
-# Release proof bundles (generated locally)
+# ---------------------------------------------------------
+# Generated outputs / reports (local only)
+# ---------------------------------------------------------
+outputs/
+exports/
+reports/
+artifacts/
+
+# ---------------------------------------------------------
+# Release proof bundles (generated locally by builder)
+# Keep the builder script tracked, ignore its local outputs
+# ---------------------------------------------------------
 release_assets/
 
-desktop.ini
+# ---------------------------------------------------------
+# Local Kaggle exports / working bundles
+# Seen in local workflow, should not pollute PRs
+# ---------------------------------------------------------
+kaggle_code3_export/
+kaggle_code3_export.zip
+kaggle_code3_vNext/
+kaggle_code3_vNext.zip
+
+# ---------------------------------------------------------
+# Data policy
+# Ignore bulky/local datasets by default
+# Keep room for tracked small fixtures/demo data
+# ---------------------------------------------------------
+data/*
+datasets/*
+
+# Allow tracked small/reference data if needed
+!data/.gitkeep
+!data/demo_csv/
+!data/demo_csv/**
+!data/fixtures_small/
+!data/fixtures_small/**
+!datasets/.gitkeep
+
+# ---------------------------------------------------------
+# Optional large data formats (uncomment if needed)
+# ---------------------------------------------------------
+# *.parquet
+# *.feather
+# *.arrow
+# *.h5
+# *.npz
+
+# ---------------------------------------------------------
+# Model / cache directories (local only)
+# ---------------------------------------------------------
+.cache/
+.huggingface/
+models/
+checkpoints/
+
+# ---------------------------------------------------------
+# Archives generated locally
+# Keep generic ZIP ignoring narrow to known local export paths above
+# to avoid accidentally ignoring intentional tracked sample archives
+# ---------------------------------------------------------
+
+# ---------------------------------------------------------
+# Tooling-specific local files
+# ---------------------------------------------------------
+.cursorignore
