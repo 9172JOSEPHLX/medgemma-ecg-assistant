@@ -2,65 +2,94 @@
 
 ## Purpose
 
-This document defines the repository branch safety rules for Appli_MedGemma_ECG.
+This document defines the repository branch safety rules for **Appli_MedGemma_ECG**.
 
-The goal is to keep the jury-validated baseline stable while allowing post-jury work to continue safely.
+The goal is to:
+- preserve the immutable jury-validated baseline,
+- keep `main` stable, reviewable, and releasable,
+- allow safe maintenance work to flow into `main`,
+- keep post-jury feature development isolated until explicitly promoted.
+
+This policy is operationally enforced through:
+- `pull_request_template.md` for PR disclosure and validation,
+- `scripts/build_proofs_bundle.py` for proof bundle generation,
+- `.gitignore` for local artifact hygiene.
+
+---
 
 ## Immutable source-of-truth
 
 The immutable jury reference is:
 
-- Tag: `v0.1.1-kaggle-jury-20260312`
-- Commit: `49de9a0`
+- **Tag:** `v0.1.1-kaggle-jury-20260312`
+- **Commit:** `49de9a0`
 
-This tag must never be modified, moved, or replaced.
+This tag must never be:
+- modified,
+- moved,
+- replaced,
+- force-updated.
+
+Any release/proof workflow must treat this tag as the final jury code truth.
+
+---
 
 ## Branch roles
 
 ### `main`
-Purpose:
+**Purpose**
 - jury-safe branch,
-- releasable branch,
-- documentation and maintenance via PR only.
+- stable branch,
+- reviewable branch,
+- releasable branch.
 
-Allowed changes:
-- docs,
+**Allowed changes**
+- documentation,
 - release notes,
 - jury appendix,
+- PR template,
+- branch policy,
 - `.gitignore`,
-- maintenance/scripts that do not alter validated runtime behavior.
+- maintenance scripts that do **not** alter validated runtime behavior,
+- release/proof tooling that does **not** alter validated runtime behavior.
 
-Forbidden during jury-safe phase:
+**Forbidden during jury-safe closure**
 - direct pushes,
 - unreviewed runtime changes,
 - post-jury feature merges,
-- `dev/post-jury -> main`.
+- `dev/post-jury -> main`,
+- changes that alter validated QC/runtime semantics without explicit re-baselining.
 
 ### `dev/maintenance-jury-safe`
-Purpose:
-- safe maintenance branch for changes that are acceptable for `main`.
+**Purpose**
+- safe staging branch for changes acceptable for `main`.
 
-Typical examples:
+**Typical examples**
 - docs updates,
 - PR templates,
 - release proof scripts,
-- repo hygiene.
+- repo hygiene,
+- non-runtime maintenance.
 
-This branch is the preferred source for safe PRs into `main`.
+This is the **preferred source branch** for safe PRs into `main`.
 
 ### `dev/post-jury`
-Purpose:
+**Purpose**
 - post-jury feature development,
 - digitization MVP/productization,
-- non-critical-path technical consolidation.
+- runtime evolution,
+- broader technical consolidation and R&D.
 
-Typical examples:
+**Typical examples**
 - digitization adapters,
+- OpenCV digitization work,
 - CLI feature work,
-- future OCR/TorchScript wiring,
-- broader post-jury R&D.
+- OCR/TorchScript integration,
+- MedGemma workflow evolution beyond the jury-safe baseline.
 
-This branch must not be merged into `main` during jury-safe closure.
+This branch must **not** be merged into `main` during jury-safe closure.
+
+---
 
 ## Pull request rules
 
@@ -68,67 +97,57 @@ This branch must not be merged into `main` during jury-safe closure.
 Allowed:
 - `dev/maintenance-jury-safe -> main`
 - dedicated docs-only branches -> `main`
+- dedicated safe maintenance branches -> `main`
 
 Not allowed during jury-safe closure:
 - `dev/post-jury -> main`
 
 ### PR requirements
-For changes targeting `main`:
-- PR required,
-- atomic scope,
-- no unrelated file changes,
-- clear title and rationale,
-- explicit statement whether runtime code is touched,
-- explicit reference to the immutable tag when relevant.
+Every PR targeting `main` must:
+- use the repository `pull_request_template.md`,
+- have atomic scope,
+- avoid unrelated file changes,
+- clearly state whether runtime code under `src/` is touched,
+- explicitly state whether jury-safe runtime invariants are preserved,
+- explicitly reference the immutable tag when relevant,
+- include validation commands and observed results.
 
-## Review rules
+If a PR touches runtime behavior, it is **not** considered maintenance-only.
 
-Any PR to `main` should state:
-- scope,
-- risk,
-- whether `src/` is touched,
-- whether QC/runtime behavior is affected,
-- validation performed.
-
-If runtime code is touched, the PR is not considered maintenance-only.
+---
 
 ## Runtime protection rules
 
-Non-negotiable:
-- do not break QC stable contract,
-- do not change baseline semantics:
-  - `09487_ok` stays `PASS / PASS / PASS`
-  - `11899` stays `WARN / WARN / WARN`
-  - SWAP warning remains acquisition-only, never FAIL by itself
-- do not modify the immutable tag.
+The following are non-negotiable unless an explicit re-baselining decision is made:
 
-## Recommended GitHub protection for `main`
+- do **not** break the QC stable contract,
+- do **not** change baseline semantics:
+  - `09487_ok` remains `PASS / PASS / PASS`
+  - `11899` remains `WARN / WARN / WARN`
+  - limb swap remains acquisition warning only and does **not** become `FAIL` by itself
+- do **not** modify the immutable tag,
+- do **not** silently widen the role of MedGemma beyond the approved QC-gated diagnostic-aid posture.
 
-Recommended settings:
-- require pull request before merging,
-- require conversation resolution,
-- require linear history,
-- disable force-push,
-- disable branch deletion,
-- require checks if CI is configured.
+If runtime code under `src/` is touched, the PR must explicitly explain:
+- what changed,
+- why it is safe,
+- how the invariants were checked,
+- what tests were run.
 
-## Practical workflow
+---
 
-### Safe maintenance/doc flow
-1. branch from `main`
-2. make small isolated change
-3. open PR to `main`
-4. merge after review/checks
+## Proof and release policy
 
-### Post-jury feature flow
-1. work on `dev/post-jury`
-2. keep changes atomic
-3. validate locally
-4. do not target `main` until jury-safe phase is explicitly over
+### Standard proof bundle tool
+The standard tool for jury proof bundle generation is:
 
-## Summary
+- `scripts/build_proofs_bundle.py`
 
-- `main` = stable, reviewable, releasable
-- `dev/maintenance-jury-safe` = safe path to `main`
-- `dev/post-jury` = feature branch, isolated from `main`
-- immutable tag = final jury code truth
+### Standard safe bundle command
+When generating a jury-safe proof bundle, use the standard strict form:
+
+```bash
+python scripts/build_proofs_bundle.py \
+  --tag v0.1.1-kaggle-jury-20260312 \
+  --expected-tag-commit 49de9a0 \
+  --strict
